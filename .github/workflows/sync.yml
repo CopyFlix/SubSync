@@ -16,11 +16,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip' # كاش تلقائي لمكتبات Python
 
+      # --- 1. كاش الأدوات التنفيذية (ffmpeg & alass) ---
+      - name: Cache System Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/alass-cli
+            /usr/bin/ffmpeg
+          key: tools-binaries-v1
+
+      # --- 2. تثبيت ffmpeg (يعمل فقط في حال عدم وجوده في الكاش) ---
       - name: Install ffmpeg
+        if: steps.cache-tools.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
+      # --- 3. تثبيت alass-cli (يعمل فقط في حال عدم وجوده في الكاش) ---
       - name: Install alass-cli
+        if: steps.cache-tools.outputs.cache-hit != 'true'
         run: |
           set -e
           echo "جاري البحث عن رابط النسخة الصحيحة لـ Linux من أحدث إصدار..."
@@ -41,23 +56,26 @@ jobs:
           curl -L -o alass_download "$ASSET_URL"
 
           mkdir -p alass_bin
-          # الملف قد يكون zip مضغوط أو باينري مباشر - نتعامل مع الحالتين
           if file alass_download | grep -qi "zip"; then
             unzip -o alass_download -d alass_bin
           else
             cp alass_download alass_bin/alass-cli
           fi
 
-          # نلقط أول ملف تنفيذي جواه (بغض النظر عن اسمه بالظبط)
           BIN_PATH=$(find alass_bin -type f | head -n 1)
           echo "الملف التنفيذي الموجود: $BIN_PATH"
           sudo mv "$BIN_PATH" /usr/local/bin/alass-cli
           sudo chmod +x /usr/local/bin/alass-cli
-          alass-cli --help
 
+      # التأكد من جاهزية الأداة واستدعائها (يعمل دائماً للتحقق)
+      - name: Verify alass-cli
+        run: alass-cli --help
+
+      # --- 4. تثبيت مكتبات Python ---
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      # --- 5. تشغيل السكربت الرئيسي ---
       - name: Run sync job
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
