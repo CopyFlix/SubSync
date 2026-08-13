@@ -18,11 +18,9 @@ jobs:
           python-version: "3.11"
           cache: 'pip' # كاش تلقائي لمكتبات Python
 
-      # --- 1. تثبيت ffmpeg (إضافة جاهزة وسريعة تدعم الكاش التلقائي بشكل مثالي) ---
-      - name: Setup FFmpeg
-        uses: FedericoPonzi/setup-ffmpeg@v3
-        with:
-          architecture: x64
+      # --- 1. تثبيت FFmpeg من النظام (سريع ومضمون وبدون كاش لتفادي فقدان المكتبات) ---
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       # --- 2. كاش أداة alass-cli فقط ---
       - name: Cache alass-cli
@@ -30,7 +28,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/bin/alass-cli
-          key: alass-cli-linux-v2 # تم تغيير المفتاح لتحديث الكاش القديم
+          key: alass-cli-linux-v2
 
       # --- 3. تثبيت alass-cli (يعمل فقط في حال عدم وجوده في الكاش) ---
       - name: Install alass-cli
@@ -86,7 +84,6 @@ jobs:
           CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
           VIDEO_URL: ${{ github.event.client_payload.video_url }}
           INFOHASH: ${{ github.event.client_payload.infohash }}
-          # تمت إضافة المتغيرات الجديدة هنا 👇
           SUBTITLE_B64_GZ: ${{ github.event.client_payload.subtitle_b64_gz }}
           SUBTITLE_FILENAME: ${{ github.event.client_payload.subtitle_filename }}
           SUBTITLE_URL: ${{ github.event.client_payload.subtitle_url }}
