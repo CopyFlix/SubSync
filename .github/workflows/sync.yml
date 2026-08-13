@@ -16,13 +16,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip' # كاش تلقائي لمكتبات Python
+          cache: 'pip'
 
-      # --- 1. تثبيت FFmpeg من النظام (سريع ومضمون وبدون كاش لتفادي فقدان المكتبات) ---
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      # --- 2. كاش أداة alass-cli فقط ---
       - name: Cache alass-cli
         id: cache-alass
         uses: actions/cache@v4
@@ -30,26 +28,17 @@ jobs:
           path: ~/.local/bin/alass-cli
           key: alass-cli-linux-v2
 
-      # --- 3. تثبيت alass-cli (يعمل فقط في حال عدم وجوده في الكاش) ---
       - name: Install alass-cli
         if: steps.cache-alass.outputs.cache-hit != 'true'
         run: |
           set -e
-          echo "جاري البحث عن رابط النسخة الصحيحة لـ Linux من أحدث إصدار..."
           ASSET_URL=$(curl -s https://api.github.com/repos/kaegi/alass/releases/latest \
             | grep "browser_download_url" \
             | grep -i "linux" \
             | cut -d '"' -f 4 \
             | head -n 1)
 
-          if [ -z "$ASSET_URL" ]; then
-            echo "فشل العثور على أصل (asset) لينكس في أحدث إصدار."
-            exit 1
-          fi
-
-          echo "تحميل: $ASSET_URL"
           curl -L -o alass_download "$ASSET_URL"
-
           mkdir -p alass_bin
           if file alass_download | grep -qi "zip"; then
             unzip -o alass_download -d alass_bin
@@ -57,26 +46,20 @@ jobs:
             cp alass_download alass_bin/alass-cli
           fi
 
-          # نقل الملف التنفيذي إلى مسار خاص بالمستخدم لتسهيل الكاش
           mkdir -p ~/.local/bin
           BIN_PATH=$(find alass_bin -type f | head -n 1)
-          echo "الملف التنفيذي الموجود: $BIN_PATH"
           mv "$BIN_PATH" ~/.local/bin/alass-cli
           chmod +x ~/.local/bin/alass-cli
 
-      # --- إضافة مسار alass-cli للبيئة ليتمكن النظام من رؤيته ---
       - name: Add alass-cli to PATH
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      # التأكد من جاهزية الأداة واستدعائها (يعمل دائماً للتحقق)
       - name: Verify alass-cli
         run: alass-cli --help
 
-      # --- 4. تثبيت مكتبات Python ---
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # --- 5. تشغيل السكربت الرئيسي ---
       - name: Run sync job
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
@@ -84,6 +67,8 @@ jobs:
           CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
           VIDEO_URL: ${{ github.event.client_payload.video_url }}
           INFOHASH: ${{ github.event.client_payload.infohash }}
+          FILE_IDX: ${{ github.event.client_payload.file_idx }}
+          FLIX_ID: ${{ github.event.client_payload.flix_id }}
           SUBTITLE_B64_GZ: ${{ github.event.client_payload.subtitle_b64_gz }}
           SUBTITLE_FILENAME: ${{ github.event.client_payload.subtitle_filename }}
           SUBTITLE_URL: ${{ github.event.client_payload.subtitle_url }}
