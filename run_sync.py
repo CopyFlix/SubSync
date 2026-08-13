@@ -115,10 +115,34 @@ def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[py
     final_bytes, ext = unwrap_subtitle_bytes(raw_bytes, filename)
     text_content = detect_and_read_text(final_bytes)
     fmt = ext.lstrip(".")
+
+    subs = None
+    # المحاولة الأولى: الصيغة المستنتجة من اسم/امتداد الملف
     try:
-        subs = pysubs2.SSAFile.from_string(text_content, format_=fmt)
-    except Exception as e:
-        raise JobError(f"فشل تحليل ملف الترجمة ({fmt}): {e}")
+        candidate = pysubs2.SSAFile.from_string(text_content, format_=fmt)
+        if candidate.events:
+            subs = candidate
+    except Exception:
+        pass
+
+    # لو فشلت أو رجعت صفر أسطر (الامتداد مش مطابق فعليًا لمحتوى الملف)،
+    # نجرب الاكتشاف التلقائي لصيغة pysubs2 اعتمادًا على المحتوى نفسه
+    if subs is None:
+        try:
+            candidate = pysubs2.SSAFile.from_string(text_content)
+            if candidate.events:
+                subs = candidate
+                fmt = candidate.format or fmt
+        except Exception:
+            pass
+
+    if subs is None or not subs.events:
+        preview = text_content[:300].replace("\n", " \u23ce ")
+        raise JobError(
+            f"ملف الترجمة اتحمّل لكن مفيهوش أي أسطر مقروءة (الصيغة المفترضة: {fmt}). "
+            f"معاينة أول 300 حرف من الملف: {preview}"
+        )
+
     return subs, fmt
 
 
