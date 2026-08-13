@@ -18,24 +18,23 @@ jobs:
           python-version: "3.11"
           cache: 'pip' # كاش تلقائي لمكتبات Python
 
-      # --- 1. كاش الأدوات التنفيذية (ffmpeg & alass) ---
-      - name: Cache System Tools
-        id: cache-tools
+      # --- 1. تثبيت ffmpeg (إضافة جاهزة وسريعة تدعم الكاش التلقائي بشكل مثالي) ---
+      - name: Setup FFmpeg
+        uses: FedericoPonzi/setup-ffmpeg@v3
+        with:
+          architecture: x64
+
+      # --- 2. كاش أداة alass-cli فقط ---
+      - name: Cache alass-cli
+        id: cache-alass
         uses: actions/cache@v4
         with:
-          path: |
-            /usr/local/bin/alass-cli
-            /usr/bin/ffmpeg
-          key: tools-binaries-v1
-
-      # --- 2. تثبيت ffmpeg (يعمل فقط في حال عدم وجوده في الكاش) ---
-      - name: Install ffmpeg
-        if: steps.cache-tools.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+          path: ~/.local/bin/alass-cli
+          key: alass-cli-linux-v2 # تم تغيير المفتاح لتحديث الكاش القديم
 
       # --- 3. تثبيت alass-cli (يعمل فقط في حال عدم وجوده في الكاش) ---
       - name: Install alass-cli
-        if: steps.cache-tools.outputs.cache-hit != 'true'
+        if: steps.cache-alass.outputs.cache-hit != 'true'
         run: |
           set -e
           echo "جاري البحث عن رابط النسخة الصحيحة لـ Linux من أحدث إصدار..."
@@ -47,8 +46,6 @@ jobs:
 
           if [ -z "$ASSET_URL" ]; then
             echo "فشل العثور على أصل (asset) لينكس في أحدث إصدار."
-            echo "الأصول المتاحة فعليًا في هذا الإصدار:"
-            curl -s https://api.github.com/repos/kaegi/alass/releases/latest | grep "browser_download_url"
             exit 1
           fi
 
@@ -62,10 +59,16 @@ jobs:
             cp alass_download alass_bin/alass-cli
           fi
 
+          # نقل الملف التنفيذي إلى مسار خاص بالمستخدم لتسهيل الكاش
+          mkdir -p ~/.local/bin
           BIN_PATH=$(find alass_bin -type f | head -n 1)
           echo "الملف التنفيذي الموجود: $BIN_PATH"
-          sudo mv "$BIN_PATH" /usr/local/bin/alass-cli
-          sudo chmod +x /usr/local/bin/alass-cli
+          mv "$BIN_PATH" ~/.local/bin/alass-cli
+          chmod +x ~/.local/bin/alass-cli
+
+      # --- إضافة مسار alass-cli للبيئة ليتمكن النظام من رؤيته ---
+      - name: Add alass-cli to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       # التأكد من جاهزية الأداة واستدعائها (يعمل دائماً للتحقق)
       - name: Verify alass-cli
@@ -83,5 +86,8 @@ jobs:
           CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
           VIDEO_URL: ${{ github.event.client_payload.video_url }}
           INFOHASH: ${{ github.event.client_payload.infohash }}
+          # تمت إضافة المتغيرات الجديدة هنا 👇
+          SUBTITLE_B64_GZ: ${{ github.event.client_payload.subtitle_b64_gz }}
+          SUBTITLE_FILENAME: ${{ github.event.client_payload.subtitle_filename }}
           SUBTITLE_URL: ${{ github.event.client_payload.subtitle_url }}
         run: python run_sync.py
