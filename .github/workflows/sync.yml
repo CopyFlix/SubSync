@@ -22,7 +22,7 @@ jobs:
 
       - name: Install alass-cli
         run: |
-          curl -L -o alass.zip https://github.com/kaegi/alass/releases/download/v2.0.0/alass-linux64.zip
+          curl -L -o alass.zip https://github.com/kaegi/alass/releases/download/v2.0.0/alass-linux64
           unzip alass.zip -d alass_bin
           sudo mv alass_bin/alass-linux64 /usr/local/bin/alass-cli
           sudo chmod +x /usr/local/bin/alass-cli
