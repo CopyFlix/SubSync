@@ -57,8 +57,14 @@ D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
 
 ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY")
-SYNC_JUMP_THRESHOLD_MS = float(os.environ.get("SYNC_JUMP_THRESHOLD_MS", "400"))
-SYNC_MIN_SEGMENT_EVENTS = int(os.environ.get("SYNC_MIN_SEGMENT_EVENTS", "5"))
+# رفعنا العتبة بشكل كبير: فرق أقل من كده بين سطرين متجاورين طبيعي جدًا
+# (ضوضاء عادية في محاذاة alass) ومش دليل على قصّة حقيقية. القصّات
+# الحقيقية بتعمل فرق كبير (ثواني) بيستمر عبر كذا سطر، مش نص ثانية.
+SYNC_JUMP_THRESHOLD_MS = float(os.environ.get("SYNC_JUMP_THRESHOLD_MS", "2500"))
+SYNC_MIN_SEGMENT_EVENTS = int(os.environ.get("SYNC_MIN_SEGMENT_EVENTS", "8"))
+# أي قطعة زمنية أقصر من كده (بالثواني) شبه مؤكد إنها ضوضاء مش قصّة
+# حقيقية - مشهد كامل اتقصّ عادةً بياخد وقت أطول من كده بكتير.
+SYNC_MIN_SEGMENT_DURATION_SEC = float(os.environ.get("SYNC_MIN_SEGMENT_DURATION_SEC", "20"))
 
 # لو alass (في وضع split) أسقط أكتر من النسبة دي من الأسطر أثناء القياس،
 # بنعتبر إن نتيجة split مش موثوقة بما يكفي، وبنعمل تشغيلة احتياطية بوضع
@@ -336,12 +342,87 @@ def extract_matched_pairs(
 
 
 class SyncSegment:
-    __slots__ = ("orig_start_ms", "orig_end_ms", "offset_ms")
+    """
+    كل قطعة بقى ليها معادلتها الخاصة بالكامل: سرعة (fps_ratio) وإزاحة
+    (offset_ms/intercept) مستقلين عن باقي القطع. ده بيمتص أي انجراف
+    (drift) تدريجي في السرعة داخل القطعة نفسها، بدل ما يسرّب كقفزات
+    وهمية صغيرة بتتفسّر غلط كـ"قصّات".
+    """
+    __slots__ = ("orig_start_ms", "orig_end_ms", "fps_ratio", "offset_ms")
 
-    def __init__(self, orig_start_ms: float, orig_end_ms: float, offset_ms: float):
+    def __init__(self, orig_start_ms: float, orig_end_ms: float, fps_ratio: float, offset_ms: float):
         self.orig_start_ms = orig_start_ms
         self.orig_end_ms = orig_end_ms
+        self.fps_ratio = fps_ratio
         self.offset_ms = offset_ms
+
+
+def _linear_fit(xs: List[float], ys: List[float]) -> Tuple[float, float]:
+    """أبسط انحدار خطي (slope, intercept) بطريقة المربعات الصغرى."""
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0:
+        return 1.0, mean_y - mean_x
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def _rolling_median(values: List[float], window: int) -> List[float]:
+    """
+    بتنعّم سلسلة القيم بمتوسط نافذة متحركة (median)، عشان نقلل تأثير أي
+    سطر واحد شاذ (noise) قبل ما نحاول نكتشف قفزات حقيقية.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    half = max(1, window) // 2
+    out = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out.append(statistics.median(values[lo:hi]))
+    return out
+
+
+def _detect_breakpoints(
+    xs: List[float],
+    residuals: List[float],
+    jump_threshold_ms: float,
+    min_segment_events: int,
+    min_segment_duration_ms: float,
+    compare_window: int = 15,
+) -> List[int]:
+    """
+    بتكتشف نقاط انقطاع حقيقية بس - مش أي تذبذب طبيعي بين سطرين متجاورين.
+    بدل ما نقارن سطر بالسطر اللي جنبه (حساس جدًا للضوضاء)، بنقارن *متوسط*
+    نافذة من الأسطر قبل النقطة المرشّحة بمتوسط نافذة من الأسطر بعدها. لو
+    الفرق بين المتوسطين كبير، وكل قطعة ناتجة طولها كافٍ (عدد أسطر ومدة
+    زمنية)، هنا بس نعتبرها قصّة حقيقية.
+    """
+    n = len(residuals)
+    smoothed = _rolling_median(residuals, window=11)
+    breakpoints = [0]
+    seg_start = 0
+    i = 1
+    while i < n:
+        before = smoothed[max(seg_start, i - compare_window):i]
+        after = smoothed[i:i + compare_window]
+        if before and after:
+            diff = abs(statistics.median(after) - statistics.median(before))
+        else:
+            diff = abs(smoothed[i] - smoothed[i - 1])
+
+        if diff > jump_threshold_ms:
+            duration_ms = xs[i - 1] - xs[seg_start]
+            if (i - seg_start) >= min_segment_events and duration_ms >= min_segment_duration_ms:
+                breakpoints.append(i)
+                seg_start = i
+        i += 1
+    breakpoints.append(n)
+    return breakpoints
 
 
 def compute_piecewise_transform(
@@ -349,58 +430,73 @@ def compute_piecewise_transform(
     ys: List[float],
     jump_threshold_ms: float = SYNC_JUMP_THRESHOLD_MS,
     min_segment_events: int = SYNC_MIN_SEGMENT_EVENTS,
+    min_segment_duration_sec: float = SYNC_MIN_SEGMENT_DURATION_SEC,
 ) -> Optional[Tuple[float, List[SyncSegment]]]:
     """
     xs: توقيتات البداية الأصلية (قبل المزامنة)
     ys: توقيتات البداية المقابلة بعد المزامنة (نفس السطر، متطابق بالهوية
         مش بالفهرس - شوف extract_matched_pairs)
+
+    الخوارزمية:
+    1. نعمل انحدار خطي عام (global) على كل النقاط، بس عشان نستخدمه كمرجع
+       لاكتشاف نقاط الانقطاع (breakpoints) وكـ fallback للقطع القصيرة.
+    2. نكتشف نقاط الانقطاع الحقيقية بس (شوف _detect_breakpoints).
+    3. كل قطعة ناتجة بتاخد انحدارها الخطي الخاص بيها (سرعة+إزاحة مستقلين)،
+       لو عندها نقط كفاية لحساب موثوق - وإلا بترجع لقيمة الـ fallback العامة.
     """
     n = len(xs)
     if n < 2:
         return None
 
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    denominator = sum((x - mean_x) ** 2 for x in xs)
-    if denominator == 0:
-        fps_ratio = 1.0
-    else:
-        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-        fps_ratio = numerator / denominator
+    global_fps_ratio, _ = _linear_fit(xs, ys)
+    residuals = [ys[i] - global_fps_ratio * xs[i] for i in range(n)]
 
-    residuals = [ys[i] - fps_ratio * xs[i] for i in range(n)]
+    breakpoints = _detect_breakpoints(
+        xs, residuals, jump_threshold_ms, min_segment_events, min_segment_duration_sec * 1000
+    )
 
     segments: List[SyncSegment] = []
-    seg_start_idx = 0
-    for i in range(1, n):
-        if abs(residuals[i] - residuals[i - 1]) > jump_threshold_ms:
-            if i - seg_start_idx >= min_segment_events:
-                seg_offset = statistics.median(residuals[seg_start_idx:i])
-                segments.append(SyncSegment(xs[seg_start_idx], xs[i - 1], seg_offset))
-                seg_start_idx = i
+    for bi in range(len(breakpoints) - 1):
+        s, e = breakpoints[bi], breakpoints[bi + 1]
+        seg_xs, seg_ys = xs[s:e], ys[s:e]
 
-    seg_offset = statistics.median(residuals[seg_start_idx:n])
-    segments.append(SyncSegment(xs[seg_start_idx], xs[n - 1], seg_offset))
+        if len(seg_xs) >= 5:
+            local_slope, local_intercept = _linear_fit(seg_xs, seg_ys)
+            # حماية: لو الانحدار المحلي طلع رقم غير منطقي (بسبب عدد نقط
+            # قليل نسبيًا أو توزيع ملتوي)، منرجعش عليه - بنستخدم السرعة
+            # العامة ونحسب بس الإزاحة (median) للقطعة دي.
+            if not (0.8 <= local_slope <= 1.25):
+                local_slope = global_fps_ratio
+                local_intercept = statistics.median(
+                    [seg_ys[i] - local_slope * seg_xs[i] for i in range(len(seg_xs))]
+                )
+        else:
+            local_slope = global_fps_ratio
+            local_intercept = statistics.median(
+                [seg_ys[i] - local_slope * seg_xs[i] for i in range(len(seg_xs))]
+            )
 
-    return fps_ratio, segments
+        segments.append(SyncSegment(seg_xs[0], seg_xs[-1], local_slope, local_intercept))
+
+    return global_fps_ratio, segments
 
 
-def offset_for_original_time(segments: List[SyncSegment], t_ms: float) -> float:
+def get_segment_for_time(segments: List[SyncSegment], t_ms: float) -> SyncSegment:
     for seg in segments:
         if t_ms <= seg.orig_end_ms:
-            return seg.offset_ms
-    return segments[-1].offset_ms
+            return seg
+    return segments[-1]
 
 
-def apply_piecewise_transform(subs: pysubs2.SSAFile, fps_ratio: float, segments: List[SyncSegment]) -> pysubs2.SSAFile:
+def apply_piecewise_transform(subs: pysubs2.SSAFile, segments: List[SyncSegment]) -> pysubs2.SSAFile:
     out = pysubs2.SSAFile()
     out.info = dict(subs.info)
     out.styles = dict(subs.styles)
     new_events = []
     for e in subs.events:
-        offset_ms = offset_for_original_time(segments, e.start)
-        new_start = e.start * fps_ratio + offset_ms
-        new_end = e.end * fps_ratio + offset_ms
+        seg = get_segment_for_time(segments, e.start)
+        new_start = e.start * seg.fps_ratio + seg.offset_ms
+        new_end = e.end * seg.fps_ratio + seg.offset_ms
         if new_end <= 0:
             # السطر ده بيقع بالكامل قبل بداية الفيديو الفعلية بعد التصحيح
             # (طبيعي لو أول offset سالب كبير)، فمفيش معنى نعرضه.
@@ -565,9 +661,9 @@ async def main():
                 transform = compute_piecewise_transform(xs, ys)
                 if transform is None:
                     raise JobError("تعذّر حساب الإزاحة من الأسطر المتطابقة")
-                fps_ratio, segments = transform
+                global_fps_ratio, segments = transform
 
-                synced_full = apply_piecewise_transform(subs, fps_ratio, segments)
+                synced_full = apply_piecewise_transform(subs, segments)
                 final_path = os.path.join(work_dir, f"final_synced.{fmt}")
                 synced_full.save(final_path, format_=fmt)
 
@@ -578,7 +674,7 @@ async def main():
                 representative_offset_sec = segments[-1].offset_ms / 1000.0
                 await upsert_subtitle_record_async(
                     session, infohash, file_idx, media_type, flix_id, fmt, gz_bytes,
-                    representative_offset_sec, fps_ratio, actual_duration, len(segments),
+                    representative_offset_sec, global_fps_ratio, actual_duration, len(segments),
                 )
 
         result = {
@@ -589,7 +685,7 @@ async def main():
             "flix_id": flix_id,
             "format": fmt,
             "actual_audio_duration_sec": round(actual_duration, 1),
-            "fps_ratio": round(fps_ratio, 6),
+            "global_fps_ratio": round(global_fps_ratio, 6),
             "sync_segments_detected": len(segments),
             "alass_mode_used": alass_mode_used,
             "lines_compared_total": total_tagged,
@@ -598,6 +694,7 @@ async def main():
                 {
                     "orig_start_sec": round(s.orig_start_ms / 1000, 1),
                     "orig_end_sec": round(s.orig_end_ms / 1000, 1),
+                    "fps_ratio": round(s.fps_ratio, 6),
                     "offset_sec": round(s.offset_ms / 1000, 3),
                 }
                 for s in segments
