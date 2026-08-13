@@ -6,11 +6,20 @@ run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخ�
 المدخلات المطلوبة (env vars):
   VIDEO_URL        - رابط مباشر لملف mkv
   INFOHASH         - الـ infohash الخاص بالتورنت (مفتاح D1)
-  
+
   خيارات الترجمة (أحدهما مطلوب):
   SUBTITLE_B64_GZ  - نص ملف الترجمة مضغوط بـ Gzip ومحكّم بـ Base64 (الخيار المفضل والأساس)
   SUBTITLE_FILENAME- (اختياري مع B64_GZ) اسم الملف لمعرفة الامتداد مثل "sub.ass" أو "sub.srt"
   SUBTITLE_URL     - رابط الترجمة الاحتياطي (srt/ass/ssa/gz/zip)
+
+  خيارات المزامنة (اختيارية):
+  TARGET_AUDIO_MINUTES - طول العينة الصوتية المُحمّلة بالدقايق (افتراضي 30، كل ما زاد كل ما زادت
+                          فرصة إن أي قصّة في نص الحلقة تقع جوه العينة)
+  ALASS_SPLIT_PENALTY   - قيمة split-penalty اللي بتتبعت لـ alass-cli (افتراضي نسيبها لـ alass،
+                          قيم أقل = يكتشف انقطاعات أكتر بحساسية أعلى، القيم المفيدة عادة 5-20)
+  SYNC_JUMP_THRESHOLD_MS - أقل فرق (بالمللي ثانية) بين إزاحتين متتاليتين يُعتبر "قفزة/قص" (افتراضي 400)
+  SYNC_MIN_SEGMENT_EVENTS - أقل عدد أسطر ترجمة عشان يتحسب كـ"قطعة" منفصلة (افتراضي 5، عشان
+                            منمنعش الضوضاء العادية من إنها تتفسّر كقص وهمي)
 
   CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
 """
@@ -23,23 +32,32 @@ import io
 import json
 import os
 import re
+import statistics
 import sys
 import tempfile
 import zipfile
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
 import pysubs2
 
 CHUNK_EXTENSION = "mkv"
-TARGET_AUDIO_SEC = 20 * 60
+
+# طول عينة الصوت المُحمّلة - كل ما زاد كل ما زادت فرصة إن أي قص في نص الحلقة يقع جواها
+TARGET_AUDIO_SEC = int(os.environ.get("TARGET_AUDIO_MINUTES", "30")) * 60
+
 PROBE_MB = 15
 SAFETY_MARGIN = 1.20
-MAX_CHUNK_MB = 1500
-DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=600)
+MAX_CHUNK_MB = 2200
+DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=900)
 D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
+
+# --- إعدادات كشف الانقطاعات (القص/المشاهد المحذوفة) ---
+ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY")  # لو None هنسيب alass على الافتراضي بتاعه
+SYNC_JUMP_THRESHOLD_MS = float(os.environ.get("SYNC_JUMP_THRESHOLD_MS", "400"))
+SYNC_MIN_SEGMENT_EVENTS = int(os.environ.get("SYNC_MIN_SEGMENT_EVENTS", "5"))
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -188,7 +206,7 @@ async def get_media_duration_seconds_async(path):
 async def extract_audio_async(video_chunk_path, audio_out_path, duration_sec):
     cmd = ["ffmpeg", "-y", "-v", "error", "-fflags", "+genpts+igndts", "-i", video_chunk_path,
            "-t", str(duration_sec), "-vn", "-ac", "1", "-ar", "16000", audio_out_path]
-    code, _, _ = await run_subprocess_async(cmd, timeout=180)
+    code, _, _ = await run_subprocess_async(cmd, timeout=240)
     success = code == 0 and os.path.exists(audio_out_path) and os.path.getsize(audio_out_path) > 1000
     if not success:
         return False, 0
@@ -235,18 +253,85 @@ def crop_subtitle(subs: pysubs2.SSAFile, max_seconds: float) -> pysubs2.SSAFile:
     return cropped
 
 
-def apply_offset_and_fps(subs: pysubs2.SSAFile, offset_seconds: float, fps_ratio: float = 1.0) -> pysubs2.SSAFile:
-    offset_ms = offset_seconds * 1000
+class SyncSegment:
+    """قطعة زمنية (بتوقيت الملف الأصلي) لها إزاحتها الخاصة بعد اكتشاف نقاط الانقطاع."""
+    __slots__ = ("orig_start_ms", "orig_end_ms", "offset_ms")
+
+    def __init__(self, orig_start_ms: float, orig_end_ms: float, offset_ms: float):
+        self.orig_start_ms = orig_start_ms
+        self.orig_end_ms = orig_end_ms
+        self.offset_ms = offset_ms
+
+
+def compute_piecewise_transform(
+    orig_events, synced_events,
+    jump_threshold_ms: float = SYNC_JUMP_THRESHOLD_MS,
+    min_segment_events: int = SYNC_MIN_SEGMENT_EVENTS,
+) -> Optional[Tuple[float, List[SyncSegment]]]:
+    """
+    بدل ما نحسب إزاحة/فارق-سرعة واحد ثابت على الملف كله (اللي بيبوظ لما يبقى فيه
+    قص/مشهد محذوف في النص)، هنا بنحسب:
+      1. fps_ratio عام واحد (نسبة السرعة عادة ثابتة على الفيديو كله، مش القص اللي بيغيّرها).
+      2. بعد شيل تأثير fps_ratio، بنحسب الإزاحة المتبقية (residual) لكل سطر، وندوّر على
+         "قفزات" فيها - يعني نقط الانقطاع الفعلية - ونقسّم الأحداث على أساسها لقطع
+         (segments)، كل قطعة ليها إزاحتها الخاصة (median مش average عشان نتلافى تأثير
+         أي قيم شاذة من alass).
+    """
+    n = min(len(orig_events), len(synced_events))
+    if n < 2:
+        return None
+
+    xs = [orig_events[i].start for i in range(n)]
+    ys = [synced_events[i].start for i in range(n)]
+
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0:
+        fps_ratio = 1.0
+    else:
+        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+        fps_ratio = numerator / denominator
+
+    residuals = [ys[i] - fps_ratio * xs[i] for i in range(n)]
+
+    segments: List[SyncSegment] = []
+    seg_start_idx = 0
+    for i in range(1, n):
+        if abs(residuals[i] - residuals[i - 1]) > jump_threshold_ms:
+            if i - seg_start_idx >= min_segment_events:
+                seg_offset = statistics.median(residuals[seg_start_idx:i])
+                segments.append(SyncSegment(xs[seg_start_idx], xs[i - 1], seg_offset))
+                seg_start_idx = i
+            # لو القطعة قبل نقطة الانكسار قصيرة جدًا (أقل من الحد الأدنى) بنتجاهلها كضوضاء
+            # ومنقطعش القطعة الحالية - بنسيبها تكبر لحد ما توصل حجم كافي أو الآخر.
+
+    seg_offset = statistics.median(residuals[seg_start_idx:n])
+    segments.append(SyncSegment(xs[seg_start_idx], xs[n - 1], seg_offset))
+
+    return fps_ratio, segments
+
+
+def offset_for_original_time(segments: List[SyncSegment], t_ms: float) -> float:
+    for seg in segments:
+        if t_ms <= seg.orig_end_ms:
+            return seg.offset_ms
+    # الأحداث اللي بعد آخر نقطة اتقاست: نمدّ إزاحة آخر قطعة (أقرب تقدير متاح لدينا)
+    return segments[-1].offset_ms
+
+
+def apply_piecewise_transform(subs: pysubs2.SSAFile, fps_ratio: float, segments: List[SyncSegment]) -> pysubs2.SSAFile:
     out = pysubs2.SSAFile()
     out.info = dict(subs.info)
     out.styles = dict(subs.styles)
     new_events = []
     for e in subs.events:
-        new_e = e.copy()
+        offset_ms = offset_for_original_time(segments, e.start)
         new_start = e.start * fps_ratio + offset_ms
         new_end = e.end * fps_ratio + offset_ms
         if new_end <= 0:
             continue
+        new_e = e.copy()
         new_e.start = max(0, int(round(new_start)))
         new_e.end = max(0, int(round(new_end)))
         new_events.append(new_e)
@@ -254,44 +339,27 @@ def apply_offset_and_fps(subs: pysubs2.SSAFile, offset_seconds: float, fps_ratio
     return out
 
 
-def compute_linear_transform(orig_events, synced_events):
-    n = min(len(orig_events), len(synced_events))
-    if n < 2:
-        return None
-
-    xs = [orig_events[i].start for i in range(n)]
-    ys = [synced_events[i].start for i in range(n)]
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-
-    denominator = sum((x - mean_x) ** 2 for x in xs)
-    if denominator == 0:
-        ratio = 1.0
-    else:
-        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-        ratio = numerator / denominator
-
-    offset_ms = mean_y - ratio * mean_x
-    return ratio, offset_ms / 1000.0
-
-
 # ============================================================
 # Cloudflare D1
 # ============================================================
-async def upsert_subtitle_record_async(session, infohash, ext, gz_bytes, offset_seconds, fps_ratio, audio_duration_sec):
+async def upsert_subtitle_record_async(session, infohash, ext, gz_bytes, offset_seconds, fps_ratio, audio_duration_sec, segments_count):
     content_b64 = base64.b64encode(gz_bytes).decode("ascii")
     if len(content_b64) > D1_MAX_VALUE_BYTES:
         raise JobError(f"ملف الترجمة المضغوط أكبر من الحد المسموح في D1 ({len(content_b64)} بايت بعد base64)")
 
     sql = """
-        INSERT INTO subtitles (infohash, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        INSERT INTO subtitles (infohash, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(infohash) DO UPDATE SET
             ext = excluded.ext, content_b64 = excluded.content_b64, size_bytes = excluded.size_bytes,
             offset_seconds = excluded.offset_seconds, fps_ratio = excluded.fps_ratio,
-            audio_duration_sec = excluded.audio_duration_sec, created_at = excluded.created_at
+            audio_duration_sec = excluded.audio_duration_sec, sync_segments = excluded.sync_segments,
+            created_at = excluded.created_at
     """
-    payload = {"sql": sql, "params": [infohash, ext, content_b64, len(gz_bytes), offset_seconds, fps_ratio, audio_duration_sec]}
+    payload = {
+        "sql": sql,
+        "params": [infohash, ext, content_b64, len(gz_bytes), offset_seconds, fps_ratio, audio_duration_sec, segments_count],
+    }
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     async with session.post(D1_QUERY_URL, json=payload, headers=headers) as resp:
         data = await resp.json()
@@ -316,7 +384,7 @@ async def main():
     try:
         with tempfile.TemporaryDirectory() as work_dir:
             async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT_SEC, headers=DEFAULT_HEADERS) as session:
-                
+
                 # --- التعامل مع مصدر الترجمة (سواء Base64+Gzip أو URL) ---
                 if subtitle_b64_gz:
                     try:
@@ -350,10 +418,16 @@ async def main():
                 cropped_path = os.path.join(work_dir, f"cropped.{fmt}")
                 cropped.save(cropped_path, format_=fmt)
 
+                # --- alass-cli: مسموح دلوقتي بالـ split mode بدل --no-split ---
+                # split mode هو اللي بيخلي alass قادر يكتشف قص/مشاهد محذوفة/فواصل إعلانات
+                # وسط الملف بدل افتراض إزاحة ثابتة واحدة على طول الفيديو.
+                alass_cmd = ["alass-cli", audio_source, cropped_path]
                 cropped_synced_path = os.path.join(work_dir, f"cropped_synced.{fmt}")
-                returncode, stdout, stderr = await run_subprocess_async(
-                    ["alass-cli", audio_source, cropped_path, cropped_synced_path, "--no-split"], timeout=120
-                )
+                alass_cmd.append(cropped_synced_path)
+                if ALASS_SPLIT_PENALTY:
+                    alass_cmd += ["--split-penalty", str(ALASS_SPLIT_PENALTY)]
+
+                returncode, stdout, stderr = await run_subprocess_async(alass_cmd, timeout=180)
                 if returncode != 0:
                     raise JobError(f"خطأ في alass-cli: {stderr}")
 
@@ -362,15 +436,15 @@ async def main():
                 except Exception as e:
                     raise JobError(f"فشل قراءة ملف الإخراج من alass-cli: {e}")
 
-                transform = compute_linear_transform(cropped.events, synced_cropped_subs.events)
+                transform = compute_piecewise_transform(cropped.events, synced_cropped_subs.events)
                 if transform is None:
                     raise JobError(
                         "تعذّر حساب الإزاحة - عدد أسطر الترجمة المتاحة للمقارنة غير كافٍ "
                         f"(الأصلي: {len(cropped.events)}, بعد المزامنة: {len(synced_cropped_subs.events)})"
                     )
-                fps_ratio, offset = transform
+                fps_ratio, segments = transform
 
-                synced_full = apply_offset_and_fps(subs, offset, fps_ratio)
+                synced_full = apply_piecewise_transform(subs, fps_ratio, segments)
                 final_path = os.path.join(work_dir, f"final_synced.{fmt}")
                 synced_full.save(final_path, format_=fmt)
 
@@ -378,15 +452,29 @@ async def main():
                     final_bytes = f.read()
                 gz_bytes = gzip.compress(final_bytes, compresslevel=9)
 
-                await upsert_subtitle_record_async(session, infohash, fmt, gz_bytes, offset, fps_ratio, actual_duration)
+                # بنسجّل إزاحة "آخر قطعة" لأنها الأقرب لأي حاجة بعد آخر نقطة اتقاست فعليًا،
+                # وده بردو اللي هيتطبّق على أي سطر بعد نهاية العينة المُحمّلة (الامتداد/extrapolation)
+                representative_offset_sec = segments[-1].offset_ms / 1000.0
+                await upsert_subtitle_record_async(
+                    session, infohash, fmt, gz_bytes,
+                    representative_offset_sec, fps_ratio, actual_duration, len(segments),
+                )
 
         result = {
             "status": "success",
             "infohash": infohash,
             "format": fmt,
             "actual_audio_duration_sec": round(actual_duration, 1),
-            "offset_seconds": round(offset, 3),
             "fps_ratio": round(fps_ratio, 6),
+            "sync_segments_detected": len(segments),
+            "segments_detail": [
+                {
+                    "orig_start_sec": round(s.orig_start_ms / 1000, 1),
+                    "orig_end_sec": round(s.orig_end_ms / 1000, 1),
+                    "offset_sec": round(s.offset_ms / 1000, 3),
+                }
+                for s in segments
+            ],
             "gzip_size_bytes": len(gz_bytes),
         }
         print(json.dumps(result, ensure_ascii=False))
