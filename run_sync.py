@@ -230,6 +230,32 @@ def apply_offset_and_fps(subs: pysubs2.SSAFile, offset_seconds: float, fps_ratio
     return out
 
 
+def compute_linear_transform(orig_events, synced_events):
+    """
+    يحسب fps_ratio و offset_seconds بمقارنة توقيتات الأحداث مباشرة (قبل وبعد
+    مزامنة alass) بدل تحليل نص اللوج - أكثر أمانًا ضد تغيّر صيغة رسائل alass
+    بين الإصدارات. يستخدم انحدار خطي بسيط على كل الأزواج المتاحة.
+    """
+    n = min(len(orig_events), len(synced_events))
+    if n < 2:
+        return None
+
+    xs = [orig_events[i].start for i in range(n)]
+    ys = [synced_events[i].start for i in range(n)]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0:
+        ratio = 1.0
+    else:
+        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+        ratio = numerator / denominator
+
+    offset_ms = mean_y - ratio * mean_x
+    return ratio, offset_ms / 1000.0  # (fps_ratio, offset_seconds)
+
+
 def parse_alass_offset(alass_output: str):
     matches = re.findall(r"shifted block of (\d+) subtitles with length ([\d:.]+) by (-?[\d:.]+)", alass_output)
     if not matches:
@@ -323,17 +349,26 @@ async def main():
                 cropped.save(cropped_path, format_=fmt)
 
                 cropped_synced_path = os.path.join(work_dir, f"cropped_synced.{fmt}")
+                # --no-splits يجبر alass على إزاحة موحّدة واحدة (بدون تقسيمات لمناطق مختلفة) -
+                # ده يطابق افتراضنا إننا هنطبّق نفس الإزاحة/النسبة على الملف الكامل بعدين
                 returncode, stdout, stderr = await run_subprocess_async(
-                    ["alass-cli", audio_source, cropped_path, cropped_synced_path], timeout=120
+                    ["alass-cli", audio_source, cropped_path, cropped_synced_path, "--no-splits"], timeout=120
                 )
                 if returncode != 0:
                     raise JobError(f"خطأ في alass-cli: {stderr}")
 
-                alass_out = stderr + stdout
-                offset = parse_alass_offset(alass_out)
-                if offset is None:
-                    raise JobError("لم يتم التعرف على قيمة الإزاحة من alass")
-                fps_ratio = parse_alass_fps_ratio(alass_out)
+                try:
+                    synced_cropped_subs = pysubs2.SSAFile.load(cropped_synced_path, format_=fmt)
+                except Exception as e:
+                    raise JobError(f"فشل قراءة ملف الإخراج من alass-cli: {e}")
+
+                transform = compute_linear_transform(cropped.events, synced_cropped_subs.events)
+                if transform is None:
+                    raise JobError(
+                        "تعذّر حساب الإزاحة - عدد أسطر الترجمة المتاحة للمقارنة غير كافٍ "
+                        f"(الأصلي: {len(cropped.events)}, بعد المزامنة: {len(synced_cropped_subs.events)})"
+                    )
+                fps_ratio, offset = transform
 
                 synced_full = apply_offset_and_fps(subs, offset, fps_ratio)
                 final_path = os.path.join(work_dir, f"final_synced.{fmt}")
