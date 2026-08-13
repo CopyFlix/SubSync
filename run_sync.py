@@ -291,9 +291,14 @@ async def upsert_subtitle_record_async(
     if len(content_b64) > D1_MAX_VALUE_BYTES:
         raise JobError(f"ملف الترجمة المضغوط أكبر من الحد المسموح في D1 ({len(content_b64)} بايت بعد base64)")
 
+    # عمود sync_segments في الجدول عندك NOT NULL (من تعديل قديم). النسخة
+    # دي بتحسب إزاحة واحدة بس لكل الملف، يعني "قطعة" واحدة منطقيًا،
+    # فبنبعت 1 ثابتة عشان القيد ميفشلش.
+    sync_segments = 1
+
     sql = """
-        INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(infohash, file_idx) DO UPDATE SET
             media_type = excluded.media_type,
             flix_id = excluded.flix_id,
@@ -303,11 +308,12 @@ async def upsert_subtitle_record_async(
             offset_seconds = excluded.offset_seconds,
             fps_ratio = excluded.fps_ratio,
             audio_duration_sec = excluded.audio_duration_sec,
+            sync_segments = excluded.sync_segments,
             created_at = excluded.created_at
     """
     payload = {
         "sql": sql,
-        "params": [infohash, file_idx, media_type, flix_id, ext, content_b64, len(gz_bytes), offset_seconds, fps_ratio, audio_duration_sec],
+        "params": [infohash, file_idx, media_type, flix_id, ext, content_b64, len(gz_bytes), offset_seconds, fps_ratio, audio_duration_sec, sync_segments],
     }
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     async with session.post(D1_QUERY_URL, json=payload, headers=headers) as resp:
