@@ -36,6 +36,14 @@ DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=600)
 D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
 
+# مواقع كتير (زي OpenSubtitles) بترفض الطلبات اللي معاها User-Agent افتراضي
+# بتاع مكتبات زي aiohttp/requests وتعتبرها bot. بنبعت User-Agent شبه متصفح حقيقي.
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+}
+
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_D1_DATABASE_ID = os.environ.get("CF_D1_DATABASE_ID")
@@ -288,12 +296,16 @@ async def main():
 
     try:
         with tempfile.TemporaryDirectory() as work_dir:
-            async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT_SEC) as session:
+            async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT_SEC, headers=DEFAULT_HEADERS) as session:
                 if not subtitle_url:
                     raise JobError("SUBTITLE_URL مطلوب في هذه النسخة")
                 async with session.get(subtitle_url) as resp:
                     if resp.status != 200:
-                        raise JobError("فشل تحميل ملف الترجمة من الرابط")
+                        body_preview = (await resp.text(errors="replace"))[:300]
+                        raise JobError(
+                            f"فشل تحميل ملف الترجمة من الرابط (HTTP {resp.status}). "
+                            f"معاينة الرد: {body_preview}"
+                        )
                     raw_bytes = await resp.read()
                 raw_filename = os.path.basename(urlparse(subtitle_url).path) or "sub.srt"
 
