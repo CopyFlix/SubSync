@@ -10,8 +10,28 @@ run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخ�
   FILE_IDX         - (اختياري) رقم الملف داخل التورنت (إذا لم يرسل يؤخذ من FLIX_ID أو يوضع 0)
   SUBTITLE_B64_GZ  - نص ملف الترجمة مضغوط بـ Gzip ومحكّم بـ Base64
   SUBTITLE_URL     - (بديل) رابط الترجمة الاحتياطي
+  ALASS_SPLIT_PENALTY - (اختياري) قيمة split-penalty الممررة لـ alass-cli (افتراضي: 7)
 
   CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
+
+--------------------------------------------------------------------------
+تعديل مهم عن النسخة السابقة:
+--------------------------------------------------------------------------
+النسخة القديمة كانت تستخدم `alass-cli --no-split` ثم تحسب خط انحدار خطي
+واحد (offset + fps_ratio) من الأسطر المطابقة وتمدّه على الحلقة/الفيلم كله.
+هذا يفشل تحديدًا عند وجود مشهد محذوف/مقطوع (شائع في الأنمي) لأن الجزء اللي
+بعد نقطة القطع يحتاج إزاحة مختلفة عن الجزء اللي قبلها.
+
+التعديل هنا:
+  1) حذف --no-split وتفعيل split-penalty بحيث alass نفسه يكتشف نقاط
+     القطع داخل نافذة الصوت (20 دقيقة تبقى كافية لمعظم حلقات الأنمي).
+  2) بدل ما نعمل "خط واحد" من نتائج alass، بنستخدم التوقيت اللي رجّعه
+     alass لكل سطر **مباشرة** (مطابقة سطر بسطر بالاندكس الأصلي)، وده
+     بيحافظ تلقائيًا على أي تعدد في القطع اللي اكتشفه.
+  3) الأسطر النادرة اللي بعد نهاية نافذة الصوت (غالبًا بس في نهايات
+     الأفلام الطويلة) بتتمدد بخط محلي محسوب من آخر جزء متزامن فعليًا،
+     مش من الحلقة كلها.
+--------------------------------------------------------------------------
 """
 
 import asyncio
@@ -25,7 +45,7 @@ import re
 import sys
 import tempfile
 import zipfile
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 
 import aiohttp
@@ -41,6 +61,11 @@ MAX_CHUNK_MB = 1500
 DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=600)
 D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
+
+# قيمة split-penalty لـ alass-cli. القيم الأصغر تخلي alass يكتشف نقاط قطع
+# أكتر (حساس أكتر لمشاهد محذوفة قصيرة)، والقيم الأكبر تخليه يتجاهل فروق
+# بسيطة ويعتبرها ضجيج. القيم المفيدة عادة بين 5 و20 (حسب نسخة alass).
+ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY", "7")
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -119,11 +144,9 @@ def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[py
     final_bytes, ext = unwrap_subtitle_bytes(raw_bytes, filename)
     text_content = detect_and_read_text(final_bytes)
 
-    # محاولة معرفة الصيغة تلقائياً من محتوى النص نفسه
     subs = None
     detected_fmt = "srt"
 
-    # تجربة قراءته كـ ASS/SSA أولاً
     try:
         candidate = pysubs2.SSAFile.from_string(text_content, format_="ass")
         if candidate.events:
@@ -132,7 +155,6 @@ def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[py
     except Exception:
         pass
 
-    # إذا لم ينفع كـ ASS نجرب SRT أو القراءة التلقائية
     if subs is None:
         try:
             candidate = pysubs2.SSAFile.from_string(text_content)
@@ -232,32 +254,25 @@ async def download_and_extract_target_duration_async(session, url, output_dir, c
 # ============================================================
 # معالجة الترجمة على مستوى الـ events
 # ============================================================
-def crop_subtitle(subs: pysubs2.SSAFile, max_seconds: float) -> pysubs2.SSAFile:
+def crop_subtitle_with_indices(subs: pysubs2.SSAFile, max_seconds: float):
+    """
+    زي crop_subtitle القديمة، لكن بترجع كمان قائمة بالاندكسات الأصلية
+    (المواقع في subs.events) لكل سطر تم تضمينه، عشان نقدر نربط ناتج
+    alass بالسطر الأصلي المطابق بالظبط لاحقًا.
+    """
     max_ms = max_seconds * 1000
     cropped = pysubs2.SSAFile()
     cropped.info = dict(subs.info)
     cropped.styles = dict(subs.styles)
-    cropped.events = [e.copy() for e in subs.events if e.start <= max_ms]
-    return cropped
 
-
-def apply_offset_and_fps(subs: pysubs2.SSAFile, offset_seconds: float, fps_ratio: float = 1.0) -> pysubs2.SSAFile:
-    offset_ms = offset_seconds * 1000
-    out = pysubs2.SSAFile()
-    out.info = dict(subs.info)
-    out.styles = dict(subs.styles)
-    new_events = []
-    for e in subs.events:
-        new_e = e.copy()
-        new_start = e.start * fps_ratio + offset_ms
-        new_end = e.end * fps_ratio + offset_ms
-        if new_end <= 0:
-            continue
-        new_e.start = max(0, int(round(new_start)))
-        new_e.end = max(0, int(round(new_end)))
-        new_events.append(new_e)
-    out.events = new_events
-    return out
+    indices: List[int] = []
+    events = []
+    for idx, e in enumerate(subs.events):
+        if e.start <= max_ms:
+            indices.append(idx)
+            events.append(e.copy())
+    cropped.events = events
+    return cropped, indices
 
 
 def compute_linear_transform(orig_events, synced_events):
@@ -281,20 +296,93 @@ def compute_linear_transform(orig_events, synced_events):
     return ratio, offset_ms / 1000.0
 
 
+def count_sync_segments(orig_events, synced_events, jump_threshold_ms=1000) -> int:
+    """
+    تقدير تقريبي لعدد "القطع" اللي اكتشفها alass، عن طريق حساب عدد
+    القفزات الكبيرة (> jump_threshold_ms) في فرق التوقيت بين أسطر متتالية.
+    مفيد فقط للتسجيل/المراقبة، مش مستخدم في بناء الملف النهائي.
+    """
+    n = min(len(orig_events), len(synced_events))
+    if n < 2:
+        return 1
+    diffs = [synced_events[i].start - orig_events[i].start for i in range(n)]
+    segments = 1
+    for i in range(1, n):
+        if abs(diffs[i] - diffs[i - 1]) > jump_threshold_ms:
+            segments += 1
+    return segments
+
+
+def build_full_sync_from_alass(
+    subs: pysubs2.SSAFile,
+    original_indices: List[int],
+    cropped_events,
+    synced_cropped_events,
+) -> pysubs2.SSAFile:
+    """
+    يبني الترجمة الكاملة المزامَنة اعتمادًا على توقيت alass لكل سطر
+    مباشرة (split-aware) بدل خط انحدار واحد يُمدّ على الملف كله.
+
+    - أي سطر أصلي داخل نافذة الصوت (اللي اتقارن فعليًا في alass) بياخد
+      توقيته الجديد كما رجّعه alass حرفيًا -> بيحافظ على أي قطع/فواصل
+      متعددة اكتشفها alass تلقائيًا.
+    - أي سطر بعد نهاية نافذة الصوت (نادر، غالبًا بس في نهايات أفلام
+      طويلة) بيتمدد بخط محلي (ratio, offset) محسوب من آخر جزء متزامن
+      فعليًا، مش من الملف كله.
+    """
+    n = min(len(original_indices), len(synced_cropped_events))
+    if n == 0:
+        raise JobError("لا توجد أسطر مشتركة للمقارنة بعد المزامنة")
+
+    direct_map = {}
+    for i in range(n):
+        orig_idx = original_indices[i]
+        synced_e = synced_cropped_events[i]
+        direct_map[orig_idx] = (synced_e.start, synced_e.end)
+
+    # خط الامتداد للأسطر النادرة اللي بعد نهاية نافذة الصوت: بناخد آخر
+    # جزء فعليًا متزامن (آخر ثلث الأسطر المقارنة) بدل الملف كله.
+    tail_count = max(2, n // 3)
+    tail_orig = cropped_events[n - tail_count:n]
+    tail_synced = synced_cropped_events[n - tail_count:n]
+    tail_transform = compute_linear_transform(tail_orig, tail_synced)
+    tail_ratio, tail_offset_sec = tail_transform if tail_transform else (1.0, 0.0)
+    tail_offset_ms = tail_offset_sec * 1000
+
+    out = pysubs2.SSAFile()
+    out.info = dict(subs.info)
+    out.styles = dict(subs.styles)
+
+    new_events = []
+    for idx, e in enumerate(subs.events):
+        if idx in direct_map:
+            new_start, new_end = direct_map[idx]
+        else:
+            new_start = e.start * tail_ratio + tail_offset_ms
+            new_end = e.end * tail_ratio + tail_offset_ms
+
+        if new_end <= 0:
+            continue
+
+        new_e = e.copy()
+        new_e.start = max(0, int(round(new_start)))
+        new_e.end = max(0, int(round(new_end)))
+        new_events.append(new_e)
+
+    out.events = new_events
+    return out
+
+
 # ============================================================
 # Cloudflare D1
 # ============================================================
 async def upsert_subtitle_record_async(
-    session, infohash, file_idx, media_type, flix_id, ext, gz_bytes, offset_seconds, fps_ratio, audio_duration_sec
+    session, infohash, file_idx, media_type, flix_id, ext, gz_bytes,
+    offset_seconds, fps_ratio, audio_duration_sec, sync_segments
 ):
     content_b64 = base64.b64encode(gz_bytes).decode("ascii")
     if len(content_b64) > D1_MAX_VALUE_BYTES:
         raise JobError(f"ملف الترجمة المضغوط أكبر من الحد المسموح في D1 ({len(content_b64)} بايت بعد base64)")
-
-    # عمود sync_segments في الجدول عندك NOT NULL (من تعديل قديم). النسخة
-    # دي بتحسب إزاحة واحدة بس لكل الملف، يعني "قطعة" واحدة منطقيًا،
-    # فبنبعت 1 ثابتة عشان القيد ميفشلش.
-    sync_segments = 1
 
     sql = """
         INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, created_at)
@@ -333,14 +421,12 @@ async def main():
     file_idx_raw = os.environ.get("FILE_IDX", "").strip()
     subtitle_filename = os.environ.get("SUBTITLE_FILENAME", "sub.srt").strip() or "sub.srt"
 
-    # --- التمييز التلقائي التام للأفلام vs المسلسلات ---
     file_idx = 0
     if file_idx_raw.isdigit():
         file_idx = int(file_idx_raw)
     elif flix_id.isdigit():
         file_idx = int(flix_id)
 
-    # إذا وجد flix_id أو كان file_idx أكبر من 0 تتحدد كـ مسلسل تلقائياً، وإلا فيلم
     if flix_id or file_idx > 0:
         media_type = "series"
     else:
@@ -385,13 +471,20 @@ async def main():
                 if not audio_source or actual_duration <= 5:
                     raise JobError("فشل استخراج صوت كافٍ من رابط الفيديو")
 
-                cropped = crop_subtitle(subs, actual_duration + 5)
+                # -------- التعديل الأساسي هنا --------
+                cropped, original_indices = crop_subtitle_with_indices(subs, actual_duration + 5)
                 cropped_path = os.path.join(work_dir, f"cropped.{fmt}")
                 cropped.save(cropped_path, format_=fmt)
 
                 cropped_synced_path = os.path.join(work_dir, f"cropped_synced.{fmt}")
+                # حذفنا --no-split وفعّلنا split-penalty عشان alass يقدر
+                # يكتشف مشاهد محذوفة/مقطوعة جوه نافذة الـ 20 دقيقة نفسها.
                 returncode, stdout, stderr = await run_subprocess_async(
-                    ["alass-cli", audio_source, cropped_path, cropped_synced_path, "--no-split"], timeout=180
+                    [
+                        "alass-cli", audio_source, cropped_path, cropped_synced_path,
+                        "--split-penalty", str(ALASS_SPLIT_PENALTY),
+                    ],
+                    timeout=180,
                 )
                 if returncode != 0:
                     raise JobError(f"خطأ في alass-cli: {stderr}")
@@ -401,15 +494,24 @@ async def main():
                 except Exception as e:
                     raise JobError(f"فشل قراءة ملف الإخراج من alass-cli: {e}")
 
-                transform = compute_linear_transform(cropped.events, synced_cropped_subs.events)
-                if transform is None:
+                if len(synced_cropped_subs.events) < 2 or len(cropped.events) < 2:
                     raise JobError(
-                        "تعذّر حساب الإزاحة - عدد أسطر الترجمة المتاحة للمقارنة غير كافٍ "
+                        "تعذّر حساب المزامنة - عدد أسطر الترجمة المتاحة للمقارنة غير كافٍ "
                         f"(الأصلي: {len(cropped.events)}, بعد المزامنة: {len(synced_cropped_subs.events)})"
                     )
-                fps_ratio, offset = transform
 
-                synced_full = apply_offset_and_fps(subs, offset, fps_ratio)
+                # بناء الترجمة الكاملة مباشرة من ناتج alass (split-aware)
+                # بدل خط انحدار واحد يُمدّ على الملف كله.
+                synced_full = build_full_sync_from_alass(
+                    subs, original_indices, cropped.events, synced_cropped_subs.events
+                )
+
+                # قيم تقريبية للتسجيل/المراقبة فقط في D1 (مش مستخدمة في
+                # بناء الملف النهائي، لأن كل سطر أخد توقيته الفعلي من alass).
+                overall_transform = compute_linear_transform(cropped.events, synced_cropped_subs.events)
+                overall_ratio, overall_offset = overall_transform if overall_transform else (1.0, 0.0)
+                sync_segments = count_sync_segments(cropped.events, synced_cropped_subs.events)
+
                 final_path = os.path.join(work_dir, f"final_synced.{fmt}")
                 synced_full.save(final_path, format_=fmt)
 
@@ -418,7 +520,8 @@ async def main():
                 gz_bytes = gzip.compress(final_bytes, compresslevel=9)
 
                 await upsert_subtitle_record_async(
-                    session, infohash, file_idx, media_type, flix_id, fmt, gz_bytes, offset, fps_ratio, actual_duration
+                    session, infohash, file_idx, media_type, flix_id, fmt, gz_bytes,
+                    overall_offset, overall_ratio, actual_duration, sync_segments
                 )
 
         result = {
@@ -429,8 +532,9 @@ async def main():
             "flix_id": flix_id,
             "format": fmt,
             "actual_audio_duration_sec": round(actual_duration, 1),
-            "offset_seconds": round(offset, 3),
-            "fps_ratio": round(fps_ratio, 6),
+            "overall_offset_seconds": round(overall_offset, 3),
+            "overall_fps_ratio": round(overall_ratio, 6),
+            "sync_segments_detected": sync_segments,
             "gzip_size_bytes": len(gz_bytes),
         }
         print(json.dumps(result, ensure_ascii=False))
