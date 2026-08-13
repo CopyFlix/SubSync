@@ -1,12 +1,17 @@
 """
-run_sync.py - نسخة "تشغيلة واحدة" (بدون FastAPI/job-queue) مخصّصة للعمل
-داخل GitHub Actions. بتاخد مدخلاتها من متغيرات البيئة (اللي الـ workflow
-بيمررها من client_payload)، تعالج فيلم واحد، وتخزن النتيجة في Cloudflare D1.
+run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخل GitHub Actions.
+تستقبل مدخلاتها من متغيرات البيئة (من client_payload)، تعالج فيلم واحد،
+وتخزن النتيجة في Cloudflare D1.
 
 المدخلات المطلوبة (env vars):
   VIDEO_URL        - رابط مباشر لملف mkv
   INFOHASH         - الـ infohash الخاص بالتورنت (مفتاح D1)
-  SUBTITLE_URL     - رابط الترجمة (srt/ass/ssa/gz/zip) - أو استخدم SUBTITLE_FILE_PATH بدلها
+  
+  خيارات الترجمة (أحدهما مطلوب):
+  SUBTITLE_B64_GZ  - نص ملف الترجمة مضغوط بـ Gzip ومحكّم بـ Base64 (الخيار المفضل والأساس)
+  SUBTITLE_FILENAME- (اختياري مع B64_GZ) اسم الملف لمعرفة الامتداد مثل "sub.ass" أو "sub.srt"
+  SUBTITLE_URL     - رابط الترجمة الاحتياطي (srt/ass/ssa/gz/zip)
+
   CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
 """
 
@@ -36,8 +41,6 @@ DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=600)
 D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
 
-# مواقع كتير (زي OpenSubtitles) بترفض الطلبات اللي معاها User-Agent افتراضي
-# بتاع مكتبات زي aiohttp/requests وتعتبرها bot. بنبعت User-Agent شبه متصفح حقيقي.
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -55,7 +58,7 @@ class JobError(Exception):
 
 
 # ============================================================
-# فك التغليف والتحليل (نفس منطق النسخة الرابعة)
+# فك التغليف والتحليل
 # ============================================================
 def detect_and_read_text(content_bytes: bytes) -> str:
     if content_bytes.startswith(codecs.BOM_UTF8):
@@ -117,7 +120,6 @@ def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[py
     fmt = ext.lstrip(".")
 
     subs = None
-    # المحاولة الأولى: الصيغة المستنتجة من اسم/امتداد الملف
     try:
         candidate = pysubs2.SSAFile.from_string(text_content, format_=fmt)
         if candidate.events:
@@ -125,8 +127,6 @@ def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[py
     except Exception:
         pass
 
-    # لو فشلت أو رجعت صفر أسطر (الامتداد مش مطابق فعليًا لمحتوى الملف)،
-    # نجرب الاكتشاف التلقائي لصيغة pysubs2 اعتمادًا على المحتوى نفسه
     if subs is None:
         try:
             candidate = pysubs2.SSAFile.from_string(text_content)
@@ -255,11 +255,6 @@ def apply_offset_and_fps(subs: pysubs2.SSAFile, offset_seconds: float, fps_ratio
 
 
 def compute_linear_transform(orig_events, synced_events):
-    """
-    يحسب fps_ratio و offset_seconds بمقارنة توقيتات الأحداث مباشرة (قبل وبعد
-    مزامنة alass) بدل تحليل نص اللوج - أكثر أمانًا ضد تغيّر صيغة رسائل alass
-    بين الإصدارات. يستخدم انحدار خطي بسيط على كل الأزواج المتاحة.
-    """
     n = min(len(orig_events), len(synced_events))
     if n < 2:
         return None
@@ -277,35 +272,7 @@ def compute_linear_transform(orig_events, synced_events):
         ratio = numerator / denominator
 
     offset_ms = mean_y - ratio * mean_x
-    return ratio, offset_ms / 1000.0  # (fps_ratio, offset_seconds)
-
-
-def parse_alass_offset(alass_output: str):
-    matches = re.findall(r"shifted block of (\d+) subtitles with length ([\d:.]+) by (-?[\d:.]+)", alass_output)
-    if not matches:
-        return None
-    matches.sort(key=lambda m: int(m[0]), reverse=True)
-    offset_str = matches[0][2]
-    negative = offset_str.startswith("-")
-    offset_str = offset_str.lstrip("-")
-    parts = offset_str.split(":")
-    if len(parts) == 3:
-        h, m, s = parts
-        total = int(h) * 3600 + int(m) * 60 + float(s)
-    elif len(parts) == 2:
-        m, s = parts
-        total = int(m) * 60 + float(s)
-    else:
-        total = float(parts[0])
-    return -total if negative else total
-
-
-def parse_alass_fps_ratio(alass_output: str):
-    m = re.search(r"ratio is ([\d.]+)\s*/\s*([\d.]+)", alass_output)
-    if not m:
-        return 1.0
-    num, den = float(m.group(1)), float(m.group(2))
-    return num / den if den != 0 else 1.0
+    return ratio, offset_ms / 1000.0
 
 
 # ============================================================
@@ -338,6 +305,8 @@ async def upsert_subtitle_record_async(session, infohash, ext, gz_bytes, offset_
 async def main():
     video_url = os.environ["VIDEO_URL"]
     infohash = os.environ["INFOHASH"]
+    subtitle_b64_gz = os.environ.get("SUBTITLE_B64_GZ")
+    subtitle_filename = os.environ.get("SUBTITLE_FILENAME", "subtitle.srt")
     subtitle_url = os.environ.get("SUBTITLE_URL")
 
     if not (CF_ACCOUNT_ID and CF_API_TOKEN and CF_D1_DATABASE_ID):
@@ -347,17 +316,26 @@ async def main():
     try:
         with tempfile.TemporaryDirectory() as work_dir:
             async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT_SEC, headers=DEFAULT_HEADERS) as session:
-                if not subtitle_url:
-                    raise JobError("SUBTITLE_URL مطلوب في هذه النسخة")
-                async with session.get(subtitle_url) as resp:
-                    if resp.status != 200:
-                        body_preview = (await resp.text(errors="replace"))[:300]
-                        raise JobError(
-                            f"فشل تحميل ملف الترجمة من الرابط (HTTP {resp.status}). "
-                            f"معاينة الرد: {body_preview}"
-                        )
-                    raw_bytes = await resp.read()
-                raw_filename = os.path.basename(urlparse(subtitle_url).path) or "sub.srt"
+                
+                # --- التعامل مع مصدر الترجمة (سواء Base64+Gzip أو URL) ---
+                if subtitle_b64_gz:
+                    try:
+                        raw_bytes = gzip.decompress(base64.b64decode(subtitle_b64_gz))
+                        raw_filename = subtitle_filename
+                    except Exception as e:
+                        raise JobError(f"فشل فك ضغط بيانات الترجمة الممررة بـ Base64/Gzip: {e}")
+                elif subtitle_url:
+                    async with session.get(subtitle_url) as resp:
+                        if resp.status != 200:
+                            body_preview = (await resp.text(errors="replace"))[:300]
+                            raise JobError(
+                                f"فشل تحميل ملف الترجمة من الرابط (HTTP {resp.status}). "
+                                f"معاينة الرد: {body_preview}"
+                            )
+                        raw_bytes = await resp.read()
+                    raw_filename = os.path.basename(urlparse(subtitle_url).path) or "sub.srt"
+                else:
+                    raise JobError("يجب توفير إما SUBTITLE_B64_GZ أو SUBTITLE_URL")
 
                 subs, fmt = load_subtitle_preserving_format(raw_bytes, raw_filename)
 
@@ -373,8 +351,6 @@ async def main():
                 cropped.save(cropped_path, format_=fmt)
 
                 cropped_synced_path = os.path.join(work_dir, f"cropped_synced.{fmt}")
-                # --no-splits يجبر alass على إزاحة موحّدة واحدة (بدون تقسيمات لمناطق مختلفة) -
-                # ده يطابق افتراضنا إننا هنطبّق نفس الإزاحة/النسبة على الملف الكامل بعدين
                 returncode, stdout, stderr = await run_subprocess_async(
                     ["alass-cli", audio_source, cropped_path, cropped_synced_path, "--no-split"], timeout=120
                 )
