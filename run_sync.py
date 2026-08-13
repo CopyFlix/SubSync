@@ -12,6 +12,19 @@ run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخ�
   SUBTITLE_URL     - (بديل) رابط الترجمة الاحتياطي
 
   CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
+
+=== ملاحظة مهمة (إصلاح) ===
+النسخة دي بتحل مشكلة جوهرية كانت موجودة: كان الكود بيقارن سطور الترجمة الأصلية
+مع سطور مخرجات alass بالاعتماد على *ترتيبها في الليستة (index)* فقط. لو alass
+أسقط سطر واحد (وده بيحصل كتير مع أسطر السرد فوق موسيقى/مؤثرات بدون كلام واضح)،
+كل الفهرسة اللي بعده بتنزاح، فيبقى بيقارن سطر غلط بسطر غلط تمامًا، وده اللي كان
+يسبب "تدمير" المزامنة بالكامل (أسطر بتتحذف فعليًا، وأسطر بتظهر في توقيت غلط
+تمامًا) بدل مجرد خطأ بسيط في الإزاحة.
+
+الحل: كل سطر بنبعته لـ alass بنحطله معرّف فريد (tag) في حقل Name (حقل مش
+بيتلمس أو يتلمس بصريًا في العرض)، وبعد ما alass يرجّع النتيجة، بنطابق كل سطر
+برجوع لمعرّفه هو مش لمكانه في الليستة. أي سطر alass أسقطه، بنكتشفه ونستبعده
+من حساب الـ transform بدل ما يلخبط كل حاجة بعده.
 """
 
 import asyncio
@@ -26,7 +39,7 @@ import statistics
 import sys
 import tempfile
 import zipfile
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -46,6 +59,13 @@ SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
 ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY")
 SYNC_JUMP_THRESHOLD_MS = float(os.environ.get("SYNC_JUMP_THRESHOLD_MS", "400"))
 SYNC_MIN_SEGMENT_EVENTS = int(os.environ.get("SYNC_MIN_SEGMENT_EVENTS", "5"))
+
+# لو alass أسقط أكتر من النسبة دي من الأسطر، الثقة في نتيجة المزامنة بقت
+# منخفضة جدًا (ممكن يكون فيه مشكلة تانية زي جودة صوت رديئة أو ترجمة مش
+# مطابقة للفيديو من الأساس) فبنوقف بدل ما نطلع نتيجة مضروبة.
+MAX_ALASS_DROP_RATIO = float(os.environ.get("MAX_ALASS_DROP_RATIO", "0.6"))
+
+SYNC_ID_PREFIX = "SYNCID"
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -123,12 +143,10 @@ def unwrap_subtitle_bytes(raw_bytes: bytes, filename: str) -> Tuple[bytes, str]:
 def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[pysubs2.SSAFile, str]:
     final_bytes, ext = unwrap_subtitle_bytes(raw_bytes, filename)
     text_content = detect_and_read_text(final_bytes)
-    
-    # محاولة معرفة الصيغة تلقائياً من محتوى النص نفسه
+
     subs = None
     detected_fmt = "srt"
 
-    # تجربة قراءته كـ ASS/SSA أولاً
     try:
         candidate = pysubs2.SSAFile.from_string(text_content, format_="ass")
         if candidate.events:
@@ -137,7 +155,6 @@ def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[py
     except Exception:
         pass
 
-    # إذا لم ينفع كـ ASS نجرب SRT أو القراءة التلقائية
     if subs is None:
         try:
             candidate = pysubs2.SSAFile.from_string(text_content)
@@ -243,7 +260,49 @@ def crop_subtitle(subs: pysubs2.SSAFile, max_seconds: float) -> pysubs2.SSAFile:
     cropped.info = dict(subs.info)
     cropped.styles = dict(subs.styles)
     cropped.events = [e.copy() for e in subs.events if e.start <= max_ms]
+    # لازم تكون الأسطر مرتّبة زمنيًا قبل ما نوسمها، عشان ترتيب المعرّفات
+    # (وبالتالي ترتيب الأزواج اللي هندخلها لحساب الـ transform) يبقى صح.
+    cropped.events.sort(key=lambda e: e.start)
     return cropped
+
+
+def tag_events_for_matching(cropped_subs: pysubs2.SSAFile) -> Dict[str, float]:
+    """
+    بتحط معرّف فريد لكل سطر (في حقل Name، مش بيتلمس بصريًا ومش بيأثر على
+    التوقيت) قبل ما نبعت الملف لـ alass. ده بيسمحلنا بعدين إننا نلاقي كل
+    سطر برجوع لهويته الحقيقية بدل ما نعتمد على مكانه في الليستة.
+    """
+    id_to_orig_start: Dict[str, float] = {}
+    for idx, e in enumerate(cropped_subs.events):
+        tag = f"{SYNC_ID_PREFIX}{idx:06d}"
+        e.name = tag
+        id_to_orig_start[tag] = e.start
+    return id_to_orig_start
+
+
+def extract_matched_pairs(
+    id_to_orig_start: Dict[str, float], synced_events
+) -> Tuple[List[Tuple[float, float]], int]:
+    """
+    بتدوّر في مخرجات alass عن الأسطر اللي لسه شايلة نفس معرّف الوسم، وبتبني
+    أزواج (التوقيت الأصلي، التوقيت بعد المزامنة) بالاعتماد على الهوية مش
+    على الترتيب. أي سطر alass أسقطه (معرّفه مش موجود في المخرجات) بيتسجّل
+    كـ"محذوف" وما بيدخلش في حساب الـ transform.
+    """
+    seen = set()
+    pairs: List[Tuple[float, float]] = []
+    for e in synced_events:
+        tag = e.name
+        if tag in id_to_orig_start and tag not in seen:
+            pairs.append((id_to_orig_start[tag], e.start))
+            seen.add(tag)
+
+    # نرتّب الأزواج حسب التوقيت *الأصلي* (يعني ترتيب أحداث الفيلم الحقيقي)
+    # مش حسب ترتيب ظهورها في ملف alass، عشان لو alass غيّر ترتيب الكتابة
+    # الداخلي ما يأثرش على حساب القفزات (jumps) بتاعتنا.
+    pairs.sort(key=lambda p: p[0])
+    dropped_count = len(id_to_orig_start) - len(seen)
+    return pairs, dropped_count
 
 
 class SyncSegment:
@@ -256,16 +315,19 @@ class SyncSegment:
 
 
 def compute_piecewise_transform(
-    orig_events, synced_events,
+    xs: List[float],
+    ys: List[float],
     jump_threshold_ms: float = SYNC_JUMP_THRESHOLD_MS,
     min_segment_events: int = SYNC_MIN_SEGMENT_EVENTS,
 ) -> Optional[Tuple[float, List[SyncSegment]]]:
-    n = min(len(orig_events), len(synced_events))
+    """
+    xs: توقيتات البداية الأصلية (قبل المزامنة)
+    ys: توقيتات البداية المقابلة بعد المزامنة (نفس السطر، متطابق بالهوية
+        مش بالفهرس - شوف extract_matched_pairs)
+    """
+    n = len(xs)
     if n < 2:
         return None
-
-    xs = [orig_events[i].start for i in range(n)]
-    ys = [synced_events[i].start for i in range(n)]
 
     mean_x = sum(xs) / n
     mean_y = sum(ys) / n
@@ -310,6 +372,8 @@ def apply_piecewise_transform(subs: pysubs2.SSAFile, fps_ratio: float, segments:
         new_start = e.start * fps_ratio + offset_ms
         new_end = e.end * fps_ratio + offset_ms
         if new_end <= 0:
+            # السطر ده بيقع بالكامل قبل بداية الفيديو الفعلية بعد التصحيح
+            # (طبيعي لو أول offset سالب كبير)، فمفيش معنى نعرضه.
             continue
         new_e = e.copy()
         new_e.start = max(0, int(round(new_start)))
@@ -366,14 +430,12 @@ async def main():
     file_idx_raw = os.environ.get("FILE_IDX", "").strip()
     subtitle_filename = os.environ.get("SUBTITLE_FILENAME", "sub.srt").strip() or "sub.srt"
 
-    # --- التمييز التلقائي التام للأفلام vs المسلسلات ---
     file_idx = 0
     if file_idx_raw.isdigit():
         file_idx = int(file_idx_raw)
     elif flix_id.isdigit():
         file_idx = int(flix_id)
 
-    # إذا وجد flix_id أو كان file_idx أكبر من 0 تتحدد كـ مسلسل تلقائياً، وإلا فيلم
     if flix_id or file_idx > 0:
         media_type = "series"
     else:
@@ -419,6 +481,12 @@ async def main():
                     raise JobError("فشل استخراج صوت كافٍ من رابط الفيديو")
 
                 cropped = crop_subtitle(subs, actual_duration + 5)
+                if len(cropped.events) < 2:
+                    raise JobError("عدد أسطر الترجمة داخل النطاق الزمني المتاح غير كافٍ للمزامنة")
+
+                # نوسم كل سطر بمعرّف فريد قبل ما نبعته لـ alass - ده أساس الإصلاح.
+                id_to_orig_start = tag_events_for_matching(cropped)
+
                 cropped_path = os.path.join(work_dir, f"cropped.{fmt}")
                 cropped.save(cropped_path, format_=fmt)
 
@@ -437,12 +505,32 @@ async def main():
                 except Exception as e:
                     raise JobError(f"فشل قراءة ملف الإخراج من alass-cli: {e}")
 
-                transform = compute_piecewise_transform(cropped.events, synced_cropped_subs.events)
-                if transform is None:
+                # مطابقة بالهوية (Name tag) مش بالفهرس - هنا كان أصل العطل.
+                matched_pairs, dropped_count = extract_matched_pairs(
+                    id_to_orig_start, synced_cropped_subs.events
+                )
+
+                total_tagged = len(id_to_orig_start)
+                if total_tagged and (dropped_count / total_tagged) > MAX_ALASS_DROP_RATIO:
                     raise JobError(
-                        "تعذّر حساب الإزاحة - عدد أسطر الترجمة المتاحة للمقارنة غير كافٍ "
-                        f"(الأصلي: {len(cropped.events)}, بعد المزامنة: {len(synced_cropped_subs.events)})"
+                        f"alass أسقط {dropped_count} من أصل {total_tagged} سطر "
+                        f"({dropped_count / total_tagged:.0%}) - نسبة عالية جدًا "
+                        "بحيث إن نتيجة المزامنة مش موثوقة. جرّب تزوّد TARGET_AUDIO_MINUTES "
+                        "أو تتأكد إن الترجمة فعلاً بتاعة نفس النسخة/الحلقة."
                     )
+
+                if len(matched_pairs) < 2:
+                    raise JobError(
+                        "بعد استبعاد الأسطر اللي أسقطها alass، الأسطر المتبقية "
+                        "للمقارنة مش كافية لحساب المزامنة"
+                    )
+
+                xs = [p[0] for p in matched_pairs]
+                ys = [p[1] for p in matched_pairs]
+
+                transform = compute_piecewise_transform(xs, ys)
+                if transform is None:
+                    raise JobError("تعذّر حساب الإزاحة من الأسطر المتطابقة")
                 fps_ratio, segments = transform
 
                 synced_full = apply_piecewise_transform(subs, fps_ratio, segments)
@@ -469,6 +557,8 @@ async def main():
             "actual_audio_duration_sec": round(actual_duration, 1),
             "fps_ratio": round(fps_ratio, 6),
             "sync_segments_detected": len(segments),
+            "lines_compared_total": total_tagged,
+            "lines_dropped_by_alass": dropped_count,
             "segments_detail": [
                 {
                     "orig_start_sec": round(s.orig_start_ms / 1000, 1),
