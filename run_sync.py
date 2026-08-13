@@ -352,7 +352,7 @@ async def main():
                 # --no-splits يجبر alass على إزاحة موحّدة واحدة (بدون تقسيمات لمناطق مختلفة) -
                 # ده يطابق افتراضنا إننا هنطبّق نفس الإزاحة/النسبة على الملف الكامل بعدين
                 returncode, stdout, stderr = await run_subprocess_async(
-                    ["alass-cli", audio_source, cropped_path, cropped_synced_path, "--no-splits"], timeout=120
+                    ["alass-cli", audio_source, cropped_path, cropped_synced_path, "--no-split"], timeout=120
                 )
                 if returncode != 0:
                     raise JobError(f"خطأ في alass-cli: {stderr}")
