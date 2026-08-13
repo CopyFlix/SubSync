@@ -1,0 +1,42 @@
+name: Sync Subtitle
+
+on:
+  repository_dispatch:
+    types: [sync-subtitle]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install alass-cli
+        run: |
+          curl -L -o alass.zip https://github.com/kaegi/alass/releases/download/v2.0.0/alass-linux64.zip
+          unzip alass.zip -d alass_bin
+          sudo mv alass_bin/alass-linux64 /usr/local/bin/alass-cli
+          sudo chmod +x /usr/local/bin/alass-cli
+          alass-cli --help
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync job
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+          VIDEO_URL: ${{ github.event.client_payload.video_url }}
+          INFOHASH: ${{ github.event.client_payload.infohash }}
+          SUBTITLE_URL: ${{ github.event.client_payload.subtitle_url }}
+        run: python run_sync.py
