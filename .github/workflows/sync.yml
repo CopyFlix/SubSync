@@ -22,9 +22,36 @@ jobs:
 
       - name: Install alass-cli
         run: |
-          curl -L -o alass.zip https://github.com/kaegi/alass/releases/download/v2.0.0/alass-linux64.zip
-          unzip alass.zip -d alass_bin
-          sudo mv alass_bin/alass-linux64 /usr/local/bin/alass-cli
+          set -e
+          echo "جاري البحث عن رابط النسخة الصحيحة لـ Linux من أحدث إصدار..."
+          ASSET_URL=$(curl -s https://api.github.com/repos/kaegi/alass/releases/latest \
+            | grep "browser_download_url" \
+            | grep -i "linux" \
+            | cut -d '"' -f 4 \
+            | head -n 1)
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "فشل العثور على أصل (asset) لينكس في أحدث إصدار."
+            echo "الأصول المتاحة فعليًا في هذا الإصدار:"
+            curl -s https://api.github.com/repos/kaegi/alass/releases/latest | grep "browser_download_url"
+            exit 1
+          fi
+
+          echo "تحميل: $ASSET_URL"
+          curl -L -o alass_download "$ASSET_URL"
+
+          mkdir -p alass_bin
+          # الملف قد يكون zip مضغوط أو باينري مباشر - نتعامل مع الحالتين
+          if file alass_download | grep -qi "zip"; then
+            unzip -o alass_download -d alass_bin
+          else
+            cp alass_download alass_bin/alass-cli
+          fi
+
+          # نلقط أول ملف تنفيذي جواه (بغض النظر عن اسمه بالظبط)
+          BIN_PATH=$(find alass_bin -type f | head -n 1)
+          echo "الملف التنفيذي الموجود: $BIN_PATH"
+          sudo mv "$BIN_PATH" /usr/local/bin/alass-cli
           sudo chmod +x /usr/local/bin/alass-cli
           alass-cli --help
 
