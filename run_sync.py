@@ -1,25 +1,15 @@
 """
 run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخل GitHub Actions.
-تستقبل مدخلاتها من متغيرات البيئة (من client_payload)، تعالج فيلم واحد،
+تستقبل مدخلاتها من متغيرات البيئة (من client_payload)، تعالج فيلم/حلقة واحدة،
 وتخزن النتيجة في Cloudflare D1.
 
-المدخلات المطلوبة (env vars):
+المدخلات:
   VIDEO_URL        - رابط مباشر لملف mkv
-  INFOHASH         - الـ infohash الخاص بالتورنت (مفتاح D1)
-
-  خيارات الترجمة (أحدهما مطلوب):
-  SUBTITLE_B64_GZ  - نص ملف الترجمة مضغوط بـ Gzip ومحكّم بـ Base64 (الخيار المفضل والأساس)
-  SUBTITLE_FILENAME- (اختياري مع B64_GZ) اسم الملف لمعرفة الامتداد مثل "sub.ass" أو "sub.srt"
-  SUBTITLE_URL     - رابط الترجمة الاحتياطي (srt/ass/ssa/gz/zip)
-
-  خيارات المزامنة (اختيارية):
-  TARGET_AUDIO_MINUTES - طول العينة الصوتية المُحمّلة بالدقايق (افتراضي 30، كل ما زاد كل ما زادت
-                          فرصة إن أي قصّة في نص الحلقة تقع جوه العينة)
-  ALASS_SPLIT_PENALTY   - قيمة split-penalty اللي بتتبعت لـ alass-cli (افتراضي نسيبها لـ alass،
-                          قيم أقل = يكتشف انقطاعات أكتر بحساسية أعلى، القيم المفيدة عادة 5-20)
-  SYNC_JUMP_THRESHOLD_MS - أقل فرق (بالمللي ثانية) بين إزاحتين متتاليتين يُعتبر "قفزة/قص" (افتراضي 400)
-  SYNC_MIN_SEGMENT_EVENTS - أقل عدد أسطر ترجمة عشان يتحسب كـ"قطعة" منفصلة (افتراضي 5، عشان
-                            منمنعش الضوضاء العادية من إنها تتفسّر كقص وهمي)
+  INFOHASH         - الـ infohash الخاص بالتورنت
+  FLIX_ID          - (اختياري) إذا وُجد رقم (مثلاً "27") يعتبرها حلقة مسلسل، وإذا خلا يعتبرها فيلم
+  FILE_IDX         - (اختياري) رقم الملف داخل التورنت (إذا لم يرسل يؤخذ من FLIX_ID أو يوضع 0)
+  SUBTITLE_B64_GZ  - نص ملف الترجمة مضغوط بـ Gzip ومحكّم بـ Base64
+  SUBTITLE_URL     - (بديل) رابط الترجمة الاحتياطي
 
   CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
 """
@@ -44,7 +34,6 @@ import pysubs2
 
 CHUNK_EXTENSION = "mkv"
 
-# طول عينة الصوت المُحمّلة - كل ما زاد كل ما زادت فرصة إن أي قص في نص الحلقة يقع جواها
 TARGET_AUDIO_SEC = int(os.environ.get("TARGET_AUDIO_MINUTES", "30")) * 60
 
 PROBE_MB = 15
@@ -54,8 +43,7 @@ DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=900)
 D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
 
-# --- إعدادات كشف الانقطاعات (القص/المشاهد المحذوفة) ---
-ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY")  # لو None هنسيب alass على الافتراضي بتاعه
+ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY")
 SYNC_JUMP_THRESHOLD_MS = float(os.environ.get("SYNC_JUMP_THRESHOLD_MS", "400"))
 SYNC_MIN_SEGMENT_EVENTS = int(os.environ.get("SYNC_MIN_SEGMENT_EVENTS", "5"))
 
@@ -76,7 +64,7 @@ class JobError(Exception):
 
 
 # ============================================================
-# فك التغليف والتحليل
+# فك التغليف والتحليل والتحديد التلقائي لصيغة الترجمة
 # ============================================================
 def detect_and_read_text(content_bytes: bytes) -> str:
     if content_bytes.startswith(codecs.BOM_UTF8):
@@ -135,33 +123,38 @@ def unwrap_subtitle_bytes(raw_bytes: bytes, filename: str) -> Tuple[bytes, str]:
 def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[pysubs2.SSAFile, str]:
     final_bytes, ext = unwrap_subtitle_bytes(raw_bytes, filename)
     text_content = detect_and_read_text(final_bytes)
-    fmt = ext.lstrip(".")
-
+    
+    # محاولة معرفة الصيغة تلقائياً من محتوى النص نفسه
     subs = None
+    detected_fmt = "srt"
+
+    # تجربة قراءته كـ ASS/SSA أولاً
     try:
-        candidate = pysubs2.SSAFile.from_string(text_content, format_=fmt)
+        candidate = pysubs2.SSAFile.from_string(text_content, format_="ass")
         if candidate.events:
             subs = candidate
+            detected_fmt = "ass"
     except Exception:
         pass
 
+    # إذا لم ينفع كـ ASS نجرب SRT أو القراءة التلقائية
     if subs is None:
         try:
             candidate = pysubs2.SSAFile.from_string(text_content)
             if candidate.events:
                 subs = candidate
-                fmt = candidate.format or fmt
+                detected_fmt = candidate.format or "srt"
         except Exception:
             pass
 
     if subs is None or not subs.events:
         preview = text_content[:300].replace("\n", " \u23ce ")
         raise JobError(
-            f"ملف الترجمة اتحمّل لكن مفيهوش أي أسطر مقروءة (الصيغة المفترضة: {fmt}). "
+            f"ملف الترجمة اتحمّل لكن مفيهوش أي أسطر مقروءة. "
             f"معاينة أول 300 حرف من الملف: {preview}"
         )
 
-    return subs, fmt
+    return subs, detected_fmt
 
 
 # ============================================================
@@ -242,7 +235,7 @@ async def download_and_extract_target_duration_async(session, url, output_dir, c
 
 
 # ============================================================
-# معالجة الترجمة على مستوى الـ events
+# معالجة الترجمة
 # ============================================================
 def crop_subtitle(subs: pysubs2.SSAFile, max_seconds: float) -> pysubs2.SSAFile:
     max_ms = max_seconds * 1000
@@ -254,7 +247,6 @@ def crop_subtitle(subs: pysubs2.SSAFile, max_seconds: float) -> pysubs2.SSAFile:
 
 
 class SyncSegment:
-    """قطعة زمنية (بتوقيت الملف الأصلي) لها إزاحتها الخاصة بعد اكتشاف نقاط الانقطاع."""
     __slots__ = ("orig_start_ms", "orig_end_ms", "offset_ms")
 
     def __init__(self, orig_start_ms: float, orig_end_ms: float, offset_ms: float):
@@ -268,15 +260,6 @@ def compute_piecewise_transform(
     jump_threshold_ms: float = SYNC_JUMP_THRESHOLD_MS,
     min_segment_events: int = SYNC_MIN_SEGMENT_EVENTS,
 ) -> Optional[Tuple[float, List[SyncSegment]]]:
-    """
-    بدل ما نحسب إزاحة/فارق-سرعة واحد ثابت على الملف كله (اللي بيبوظ لما يبقى فيه
-    قص/مشهد محذوف في النص)، هنا بنحسب:
-      1. fps_ratio عام واحد (نسبة السرعة عادة ثابتة على الفيديو كله، مش القص اللي بيغيّرها).
-      2. بعد شيل تأثير fps_ratio، بنحسب الإزاحة المتبقية (residual) لكل سطر، وندوّر على
-         "قفزات" فيها - يعني نقط الانقطاع الفعلية - ونقسّم الأحداث على أساسها لقطع
-         (segments)، كل قطعة ليها إزاحتها الخاصة (median مش average عشان نتلافى تأثير
-         أي قيم شاذة من alass).
-    """
     n = min(len(orig_events), len(synced_events))
     if n < 2:
         return None
@@ -303,8 +286,6 @@ def compute_piecewise_transform(
                 seg_offset = statistics.median(residuals[seg_start_idx:i])
                 segments.append(SyncSegment(xs[seg_start_idx], xs[i - 1], seg_offset))
                 seg_start_idx = i
-            # لو القطعة قبل نقطة الانكسار قصيرة جدًا (أقل من الحد الأدنى) بنتجاهلها كضوضاء
-            # ومنقطعش القطعة الحالية - بنسيبها تكبر لحد ما توصل حجم كافي أو الآخر.
 
     seg_offset = statistics.median(residuals[seg_start_idx:n])
     segments.append(SyncSegment(xs[seg_start_idx], xs[n - 1], seg_offset))
@@ -316,7 +297,6 @@ def offset_for_original_time(segments: List[SyncSegment], t_ms: float) -> float:
     for seg in segments:
         if t_ms <= seg.orig_end_ms:
             return seg.offset_ms
-    # الأحداث اللي بعد آخر نقطة اتقاست: نمدّ إزاحة آخر قطعة (أقرب تقدير متاح لدينا)
     return segments[-1].offset_ms
 
 
@@ -342,23 +322,31 @@ def apply_piecewise_transform(subs: pysubs2.SSAFile, fps_ratio: float, segments:
 # ============================================================
 # Cloudflare D1
 # ============================================================
-async def upsert_subtitle_record_async(session, infohash, ext, gz_bytes, offset_seconds, fps_ratio, audio_duration_sec, segments_count):
+async def upsert_subtitle_record_async(
+    session, infohash, file_idx, media_type, flix_id, ext, gz_bytes, offset_seconds, fps_ratio, audio_duration_sec, segments_count
+):
     content_b64 = base64.b64encode(gz_bytes).decode("ascii")
     if len(content_b64) > D1_MAX_VALUE_BYTES:
         raise JobError(f"ملف الترجمة المضغوط أكبر من الحد المسموح في D1 ({len(content_b64)} بايت بعد base64)")
 
     sql = """
-        INSERT INTO subtitles (infohash, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(infohash) DO UPDATE SET
-            ext = excluded.ext, content_b64 = excluded.content_b64, size_bytes = excluded.size_bytes,
-            offset_seconds = excluded.offset_seconds, fps_ratio = excluded.fps_ratio,
-            audio_duration_sec = excluded.audio_duration_sec, sync_segments = excluded.sync_segments,
+        INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(infohash, file_idx) DO UPDATE SET
+            media_type = excluded.media_type,
+            flix_id = excluded.flix_id,
+            ext = excluded.ext,
+            content_b64 = excluded.content_b64,
+            size_bytes = excluded.size_bytes,
+            offset_seconds = excluded.offset_seconds,
+            fps_ratio = excluded.fps_ratio,
+            audio_duration_sec = excluded.audio_duration_sec,
+            sync_segments = excluded.sync_segments,
             created_at = excluded.created_at
     """
     payload = {
         "sql": sql,
-        "params": [infohash, ext, content_b64, len(gz_bytes), offset_seconds, fps_ratio, audio_duration_sec, segments_count],
+        "params": [infohash, file_idx, media_type, flix_id, ext, content_b64, len(gz_bytes), offset_seconds, fps_ratio, audio_duration_sec, segments_count],
     }
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     async with session.post(D1_QUERY_URL, json=payload, headers=headers) as resp:
@@ -373,8 +361,25 @@ async def upsert_subtitle_record_async(session, infohash, ext, gz_bytes, offset_
 async def main():
     video_url = os.environ["VIDEO_URL"]
     infohash = os.environ["INFOHASH"]
+
+    flix_id = os.environ.get("FLIX_ID", "").strip()
+    file_idx_raw = os.environ.get("FILE_IDX", "").strip()
+    subtitle_filename = os.environ.get("SUBTITLE_FILENAME", "sub.srt").strip() or "sub.srt"
+
+    # --- التمييز التلقائي التام للأفلام vs المسلسلات ---
+    file_idx = 0
+    if file_idx_raw.isdigit():
+        file_idx = int(file_idx_raw)
+    elif flix_id.isdigit():
+        file_idx = int(flix_id)
+
+    # إذا وجد flix_id أو كان file_idx أكبر من 0 تتحدد كـ مسلسل تلقائياً، وإلا فيلم
+    if flix_id or file_idx > 0:
+        media_type = "series"
+    else:
+        media_type = "movie"
+
     subtitle_b64_gz = os.environ.get("SUBTITLE_B64_GZ")
-    subtitle_filename = os.environ.get("SUBTITLE_FILENAME", "subtitle.srt")
     subtitle_url = os.environ.get("SUBTITLE_URL")
 
     if not (CF_ACCOUNT_ID and CF_API_TOKEN and CF_D1_DATABASE_ID):
@@ -385,7 +390,6 @@ async def main():
         with tempfile.TemporaryDirectory() as work_dir:
             async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT_SEC, headers=DEFAULT_HEADERS) as session:
 
-                # --- التعامل مع مصدر الترجمة (سواء Base64+Gzip أو URL) ---
                 if subtitle_b64_gz:
                     try:
                         raw_bytes = gzip.decompress(base64.b64decode(subtitle_b64_gz))
@@ -418,9 +422,6 @@ async def main():
                 cropped_path = os.path.join(work_dir, f"cropped.{fmt}")
                 cropped.save(cropped_path, format_=fmt)
 
-                # --- alass-cli: مسموح دلوقتي بالـ split mode بدل --no-split ---
-                # split mode هو اللي بيخلي alass قادر يكتشف قص/مشاهد محذوفة/فواصل إعلانات
-                # وسط الملف بدل افتراض إزاحة ثابتة واحدة على طول الفيديو.
                 alass_cmd = ["alass-cli", audio_source, cropped_path]
                 cropped_synced_path = os.path.join(work_dir, f"cropped_synced.{fmt}")
                 alass_cmd.append(cropped_synced_path)
@@ -452,17 +453,18 @@ async def main():
                     final_bytes = f.read()
                 gz_bytes = gzip.compress(final_bytes, compresslevel=9)
 
-                # بنسجّل إزاحة "آخر قطعة" لأنها الأقرب لأي حاجة بعد آخر نقطة اتقاست فعليًا،
-                # وده بردو اللي هيتطبّق على أي سطر بعد نهاية العينة المُحمّلة (الامتداد/extrapolation)
                 representative_offset_sec = segments[-1].offset_ms / 1000.0
                 await upsert_subtitle_record_async(
-                    session, infohash, fmt, gz_bytes,
+                    session, infohash, file_idx, media_type, flix_id, fmt, gz_bytes,
                     representative_offset_sec, fps_ratio, actual_duration, len(segments),
                 )
 
         result = {
             "status": "success",
             "infohash": infohash,
+            "file_idx": file_idx,
+            "media_type": media_type,
+            "flix_id": flix_id,
             "format": fmt,
             "actual_audio_duration_sec": round(actual_duration, 1),
             "fps_ratio": round(fps_ratio, 6),
