@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg curl unzip file \
+    ffmpeg curl unzip file aria2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ASSET_URL=$(curl -s https://api.github.com/repos/kaegi/alass/releases/latest \
