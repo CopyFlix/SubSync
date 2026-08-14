@@ -5,18 +5,14 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 90 # تم زيادتها لأن Whisper يحتاج وقت معالجة أطول على الـ CPU
+    timeout-minutes: 30
     container:
       image: ghcr.io/copyflix/subsync/sync-runner:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        
       - name: Verify tools
-        run: |
-          ffmpeg -version 
-          alass-cli --help
-          
+        run: ffmpeg -version && alass-cli --help
       - name: Run sync job
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
@@ -29,5 +25,4 @@ jobs:
           SUBTITLE_B64_GZ: ${{ github.event.client_payload.subtitle_b64_gz }}
           SUBTITLE_FILENAME: ${{ github.event.client_payload.subtitle_filename }}
           SUBTITLE_URL: ${{ github.event.client_payload.subtitle_url }}
-          # WHISPER_MODEL: "base" # يمكنك تغييره إلى tiny لو أردت سرعة أكبر جداً بدقة أقل قليلاً
         run: python run_sync.py
