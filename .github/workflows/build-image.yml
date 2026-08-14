@@ -28,6 +28,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}/sync-runner:latest
+          tags: ghcr.io/copyflix/subsync/sync-runner:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
