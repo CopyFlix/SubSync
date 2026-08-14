@@ -1,2 +1,3 @@
 aiohttp
 pysubs2
+faster-whisper
