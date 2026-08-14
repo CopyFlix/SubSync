@@ -15,9 +15,38 @@ run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخ�
    الـ streaming القديمة كـ fallback.
 
 2) مشكلة "تضحية مزامنة البداية عند مشاهد محذوفة":
-   (تم تحديث هذا الجزء ليستخدم Whisper AI للتعرف على الأصوات البشرية وتجاهل الموسيقى)
-   نستخدم Faster-Whisper لاستخراج التوقيتات النقية من الصوت، ثم نستخدم alass
-   لمطابقة الترجمة المرفوعة مع هذه التوقيتات لضمان دقة 100% وحل مشاكل المشاهد المحذوفة.
+   بالتحليل الفعلي على عيّنة حقيقية، اتضح أن alass أحيانًا يضع split (أو
+   يمدّ إزاحة) خاطئة في المناطق "ضعيفة الإشارة الصوتية" في بداية الحلقة
+   (سرد + موسيقى + مؤثرات بدون حوار واضح)، لأن خوارزمية الـ voice-activity
+   ما تلاقيش فيها تطابق موثوق، فتثبت على إزاحة غلط لحد ما توصل لمنطقة حوار
+   كثيف فترجع تصحح نفسها تلقائيًا. الحل:
+     أ) رفع --split-penalty (القيمة الافتراضية عند alass هي 7؛ المدى المفيد
+        رسميًا حسب توثيق alass هو 5-20؛ القيم الأقل تضيف splits غير ضرورية).
+        رفعها يخلي alass أكثر تحفظًا فما يثقش في splits ضعيفة الدليل.
+     ب) كشف تلقائي (QA heuristic) بعد المزامنة: نقارن متوسط الإزاحة في أول
+        دقائق الحلقة (INTRO_WINDOW_SEC) بمتوسط إزاحة باقي الحلقة. لو الفرق
+        تجاوز عتبة معيّنة، نعلّم السجل needs_review=1 في D1 بدل ما نثق فيه
+        أعمى - عشان يبقى عندكم رصد آلي لأي حلقة تانية فيها نفس المشكلة.
+
+   ملحوظة: لازم تضيفوا عمود جديد لجدول subtitles قبل تشغيل هذه النسخة:
+       ALTER TABLE subtitles ADD COLUMN needs_review INTEGER DEFAULT 0;
+       ALTER TABLE subtitles ADD COLUMN split_penalty_used REAL DEFAULT 0;
+
+المدخلات:
+  VIDEO_URL        - رابط مباشر لملف mkv
+  INFOHASH         - الـ infohash الخاص بالتورنت
+  FLIX_ID          - (اختياري) إذا وُجد رقم يعتبرها حلقة مسلسل، وإذا خلا فيلم
+  FILE_IDX         - (اختياري) رقم الملف داخل التورنت
+  SUBTITLE_B64_GZ  - نص ملف الترجمة مضغوط بـ Gzip ومحكّم بـ Base64
+  SUBTITLE_URL     - (بديل) رابط الترجمة الاحتياطي
+
+  CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
+
+  ALASS_SPLIT_PENALTY   - (اختياري، افتراضي 14) قيمة split-penalty لـ alass
+  DOWNLOAD_CONNECTIONS  - (اختياري، افتراضي 8) عدد الاتصالات المتوازية لـ aria2c
+  USE_PARALLEL_DOWNLOAD - (اختياري، افتراضي "1") تفعيل/تعطيل التحميل المتوازي
+  INTRO_WINDOW_SEC      - (اختياري، افتراضي 240) نافذة "بداية الحلقة" للفحص
+  INTRO_DRIFT_THRESHOLD_SEC - (اختياري، افتراضي 1.5) عتبة تفعيل needs_review
 """
 
 import asyncio
@@ -40,39 +69,32 @@ from urllib.parse import urlparse
 import aiohttp
 import pysubs2
 
-# --- تمت إضافة مكتبة الذكاء الاصطناعي هنا ---
-from faster_whisper import WhisperModel
-
 D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
 
-# --- تم إصلاح خطأ `invalid literal for int()` بإضافة .strip() or default ---
 # مهلة استخراج الصوت الكامل عبر ffmpeg (على الملف المحلي أو streaming كـ fallback)
-FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", "").strip() or str(45 * 60))
+FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", str(45 * 60)))
 FFPROBE_TIMEOUT_SEC = 30
-ALASS_TIMEOUT_SEC = int(os.environ.get("ALASS_TIMEOUT_SEC", "").strip() or str(20 * 60))
+ALASS_TIMEOUT_SEC = int(os.environ.get("ALASS_TIMEOUT_SEC", str(20 * 60)))
 DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=600)
 
 # مهلة تحميل الفيديو الكامل عبر aria2c (أكبر من مهلة ffmpeg لأن الأفلام الكبيرة
 # ممكن تاخد وقت أطول في التحميل من وقت المعالجة)
-ARIA2_TIMEOUT_SEC = int(os.environ.get("ARIA2_TIMEOUT_SEC", "").strip() or str(60 * 60))
+ARIA2_TIMEOUT_SEC = int(os.environ.get("ARIA2_TIMEOUT_SEC", str(60 * 60)))
 ARIA2_PATH = os.environ.get("ARIA2_PATH", "aria2c")
-DOWNLOAD_CONNECTIONS = max(1, int(os.environ.get("DOWNLOAD_CONNECTIONS", "").strip() or "8"))
+DOWNLOAD_CONNECTIONS = max(1, int(os.environ.get("DOWNLOAD_CONNECTIONS", "8")))
 USE_PARALLEL_DOWNLOAD = os.environ.get("USE_PARALLEL_DOWNLOAD", "1") != "0"
-
-# نموذج Whisper المستخدم. base هو الأفضل توازناً للـ CPU.
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "").strip() or "base"
 
 # قيمة split-penalty لـ alass-cli. الافتراضي عند alass نفسه هو 7، لكن رفعناها
 # هنا لتقليل الـ splits الخاطئة في مناطق ضعيفة الإشارة (سرد/موسيقى بلا حوار).
 # جرّبوا قيم بين 10 و20 حسب نوعية المحتوى عندكم.
-ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY", "").strip() or "14"
+ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY", "14")
 
 # نافذة "بداية الحلقة" (بالثواني) التي نفحص فيها انجراف المزامنة، والعتبة
 # التي لو تجاوزها الفرق بين إزاحة البداية وإزاحة باقي الحلقة، نعلّم السجل
 # needs_review=1 بدل ما نثق فيه تلقائيًا.
-INTRO_WINDOW_SEC = float(os.environ.get("INTRO_WINDOW_SEC", "").strip() or "240")
-INTRO_DRIFT_THRESHOLD_SEC = float(os.environ.get("INTRO_DRIFT_THRESHOLD_SEC", "").strip() or "1.5")
+INTRO_WINDOW_SEC = float(os.environ.get("INTRO_WINDOW_SEC", "240"))
+INTRO_DRIFT_THRESHOLD_SEC = float(os.environ.get("INTRO_DRIFT_THRESHOLD_SEC", "1.5"))
 
 # كل كام ثانية نطبع سطر تقدّم جديد للتحميل (عشان منغرقش اللوج بآلاف الأسطر)
 PROGRESS_LOG_INTERVAL_SEC = 5
@@ -254,16 +276,26 @@ async def get_video_duration_seconds(video_path_or_url: str) -> Optional[float]:
 
 
 # ============================================================
-# التحقق من توفر aria2c في البيئة
+# جديد: التحقق من توفر aria2c في البيئة
 # ============================================================
 def aria2c_available() -> bool:
     return shutil.which(ARIA2_PATH) is not None
 
 
 # ============================================================
-# تحميل الفيديو محليًا باتصالات متوازية عبر aria2c
+# جديد: تحميل الفيديو محليًا باتصالات متوازية عبر aria2c
 # ============================================================
 async def download_video_parallel_async(video_url: str, out_path: str) -> bool:
+    """
+    يحمّل الفيديو كاملاً لملف محلي باستخدام aria2c بعدد اتصالات متوازية.
+    يرجع True لو التحميل نجح، وFalse لو فشل (وقتها هنرجع لطريقة الـ streaming
+    القديمة كـ fallback).
+
+    ليه aria2c بدل asyncio يدوي؟ لأنه أداة ناضجة وموثوقة، بتتعامل تلقائيًا مع:
+    - الرجوع لاتصال واحد لو السيرفر مايدعمش Range requests
+    - إعادة المحاولة عند انقطاع الاتصال
+    - إعادة استئناف التحميل (resume) بدل البدء من الصفر
+    """
     out_dir = os.path.dirname(out_path)
     out_name = os.path.basename(out_path)
 
@@ -311,6 +343,7 @@ async def download_video_parallel_async(video_url: str, out_path: str) -> bool:
                 pct, speed = m.group(1), m.group(2)
                 log(f"  تحميل الفيديو (aria2c): {pct}% - السرعة: {speed}/s")
             elif not m:
+                # أسطر تحذير/خطأ من aria2c نطبعها زي ما هي للتشخيص
                 log(f"  aria2c: {text[:300]}")
 
     try:
@@ -354,7 +387,7 @@ async def extract_full_audio_from_url_async(video_url: str, out_wav_path: str, t
 
 
 # ============================================================
-# استخراج الصوت من ملف محلي (سريع جدًا، بدون شبكة)
+# جديد: استخراج الصوت من ملف محلي (سريع جدًا، بدون شبكة)
 # ============================================================
 async def extract_full_audio_from_local_file_async(video_path: str, out_wav_path: str, total_duration: Optional[float]) -> None:
     cmd = [
@@ -425,9 +458,12 @@ async def _run_ffmpeg_extract(cmd, out_wav_path: str, total_duration: Optional[f
 
 
 # ============================================================
-# تنسيق موحّد يجرّب التحميل المتوازي أولاً ثم يتراجع للـ streaming
+# جديد: تنسيق موحّد يجرّب التحميل المتوازي أولاً ثم يتراجع للـ streaming
 # ============================================================
 async def obtain_full_audio_async(video_url: str, work_dir: str, total_duration: Optional[float]) -> Tuple[str, bool]:
+    """
+    يرجع (مسار ملف الصوت الناتج، هل استُخدم التحميل المحلي المتوازي).
+    """
     audio_path = os.path.join(work_dir, "full_audio.wav")
 
     if USE_PARALLEL_DOWNLOAD and aria2c_available():
@@ -438,74 +474,51 @@ async def obtain_full_audio_async(video_url: str, work_dir: str, total_duration:
                 await extract_full_audio_from_local_file_async(video_local_path, audio_path, total_duration)
                 return audio_path, True
             finally:
+                # نمسح ملف الفيديو فورًا لتوفير مساحة القرص (ممكن يكون
+                # الفيلم كبير والـ runner عنده مساحة محدودة)
                 try:
                     if os.path.exists(video_local_path):
                         os.remove(video_local_path)
                 except OSError:
                     pass
+        # لو فشل التحميل المتوازي، هنكمل تحت لطريقة الـ streaming
     elif USE_PARALLEL_DOWNLOAD and not aria2c_available():
-        log("تحذير: aria2c غير مثبّت في البيئة، هنستخدم طريقة الـ streaming القديمة. ")
+        log("تحذير: aria2c غير مثبّت في البيئة، هنستخدم طريقة الـ streaming القديمة. "
+            "(يفضّل تثبيته عبر: apt-get install -y aria2)")
 
     await extract_full_audio_from_url_async(video_url, audio_path, total_duration)
     return audio_path, False
 
 
 # ============================================================
-# دالة الذكاء الاصطناعي (Whisper) الجديدة المضافة
+# مزامنة الترجمة الكاملة عبر alass (بدون --no-splits عشان يكتشف القطع)
 # ============================================================
-def _generate_whisper_sync_file(audio_path: str, out_srt_path: str):
-    """يقرأ الصوت وينشئ ملف توقيتات دقيق جداً بناءً على التعرف الفعلي على الكلام (يتجاهل الموسيقى)"""
-    log(f"بدء تحليل الصوت باستخدام Faster-Whisper (النموذج: {WHISPER_MODEL_SIZE})...")
-    
-    model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=2)
-    segments, info = model.transcribe(
-        audio_path,
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500)
-    )
-    
-    log(f"تم التعرف على لغة الصوت: {info.language} (بثقة {info.language_probability:.2f})")
-    
-    subs = pysubs2.SSAFile()
-    for segment in segments:
-        event = pysubs2.SSAEvent(
-            start=int(segment.start * 1000), 
-            end=int(segment.end * 1000), 
-            text=segment.text
-        )
-        subs.events.append(event)
-        
-    subs.save(out_srt_path)
-    log(f"تم إنشاء التوقيت المرجعي بالذكاء الاصطناعي (خالٍ من الموسيقى): {len(subs.events)} سطر حواري.")
+async def sync_subtitle_full_async(audio_wav_path: str, subtitle_in_path: str, subtitle_out_path: str, split_penalty: str) -> None:
+    """
+    نشغّل alass على الملف الكامل *بدون* --no-splits عشان يقدر يعمل split
+    عند أي قطع/حذف مشهد يكتشفه، بدل ما نفرض عليه تحويل خطي واحد.
 
-
-# ============================================================
-# مزامنة الترجمة الكاملة (تم التعديل لدمج الذكاء الاصطناعي هنا)
-# ============================================================
-async def sync_subtitle_full_async(audio_wav_path: str, subtitle_in_path: str, subtitle_out_path: str, split_penalty: str, work_dir: str) -> None:
-    # الخطوة 1: استخراج التوقيتات النقية بالذكاء الاصطناعي
-    whisper_ref_path = os.path.join(work_dir, "whisper_reference.srt")
-    await asyncio.to_thread(_generate_whisper_sync_file, audio_wav_path, whisper_ref_path)
-
-    # الخطوة 2: استخدام alass لمطابقة الترجمة المرفوعة مع توقيتات الذكاء الاصطناعي بدقة عالية
-    log(f"بدء مزامنة الترجمة عبر alass-cli (Text-to-Text alignment، split-penalty={split_penalty})...")
-    
-    # نستخدم ملف الـ srt الناتج من whisper كمرجع بدلاً من الصوت المباشر!
-    cmd = ["alass-cli", "--split-penalty", str(split_penalty), whisper_ref_path, subtitle_in_path, subtitle_out_path]
+    split_penalty أعلى من الافتراضي (7) يخلي alass أكثر تحفظًا في إضافة
+    splits جديدة، وده بيقلل احتمال الـ splits الخاطئة في مناطق ضعيفة
+    الإشارة الصوتية (سرد/موسيقى بلا حوار) زي بداية الحلقات عادةً.
+    """
+    log(f"بدء مزامنة الترجمة عبر alass-cli (split-based alignment، split-penalty={split_penalty})...")
+    cmd = ["alass-cli", "--split-penalty", str(split_penalty), audio_wav_path, subtitle_in_path, subtitle_out_path]
     code, stdout, stderr = await run_subprocess_async(cmd, timeout=ALASS_TIMEOUT_SEC)
-    
     if stdout.strip():
         log(f"مخرجات alass-cli: {stdout.strip()[:1500]}")
     if code != 0:
         raise JobError(f"خطأ في alass-cli: {stderr[:1000]}")
     if not os.path.exists(subtitle_out_path):
         raise JobError("alass-cli لم يُنتج ملف مخرجات رغم انتهائه بنجاح")
-    
-    log("اكتملت المزامنة الهجينة (Whisper + alass) بنجاح.")
+    log("اكتملت المزامنة بنجاح.")
 
 
 def estimate_average_offset_seconds(original: pysubs2.SSAFile, synced: pysubs2.SSAFile) -> float:
+    """
+    قيمة تقريبية *للعرض/التسجيل فقط* - متوسط الفرق بين توقيتات أول عدد من
+    الأسطر المتطابقة بالترتيب قبل/بعد المزامنة.
+    """
     n = min(len(original.events), len(synced.events), 50)
     if n < 1:
         return 0.0
@@ -514,7 +527,7 @@ def estimate_average_offset_seconds(original: pysubs2.SSAFile, synced: pysubs2.S
 
 
 # ============================================================
-# كشف انجراف المزامنة في بداية الحلقة (intro drift detection)
+# جديد: كشف انجراف المزامنة في بداية الحلقة (intro drift detection)
 # ============================================================
 def detect_intro_drift(
     original: pysubs2.SSAFile,
@@ -522,6 +535,14 @@ def detect_intro_drift(
     intro_window_sec: float = INTRO_WINDOW_SEC,
     drift_threshold_sec: float = INTRO_DRIFT_THRESHOLD_SEC,
 ) -> Tuple[bool, float, float]:
+    """
+    يقارن متوسط إزاحة الأسطر اللي بدايتها الأصلية جوه أول intro_window_sec
+    ثانية من الحلقة، بمتوسط إزاحة باقي الأسطر. لو الفرق تجاوز العتبة، ده
+    مؤشر على المشكلة اللي بنعالجها: alass بيمدّ إزاحة خاطئة على البداية
+    (منطقة ضعيفة الإشارة) لحد ما يلاقي حوار كثيف يصحح بيه نفسه.
+
+    يرجع (needs_review, intro_avg_offset, rest_avg_offset)
+    """
     n = min(len(original.events), len(synced.events))
     if n < 4:
         return False, 0.0, 0.0
@@ -564,9 +585,17 @@ async def upsert_subtitle_record_async(
     if len(content_b64) > D1_MAX_VALUE_BYTES:
         raise JobError(f"ملف الترجمة المضغوط أكبر من الحد المسموح في D1 ({len(content_b64)} بايت بعد base64)")
 
+    # ملحوظة: بعد التحويل لمزامنة متعددة النقاط (splits)، offset_seconds
+    # هنا قيمة تقريبية وصفية فقط (متوسط) - مش قيمة تصحيح تُستخدم لاحقًا.
+    # fps_ratio لم يعد له معنى واحد فبنثبته على 1.0. sync_segments كانت
+    # NOT NULL في الجدول القديم فبنسيبها 1 للتوافق.
     fps_ratio = 1.0
     sync_segments = 1
 
+    # ملحوظة: العمودين needs_review و split_penalty_used لازم تضيفوهم يدويًا
+    # مرة واحدة عبر:
+    #   ALTER TABLE subtitles ADD COLUMN needs_review INTEGER DEFAULT 0;
+    #   ALTER TABLE subtitles ADD COLUMN split_penalty_used REAL DEFAULT 0;
     sql = """
         INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, needs_review, split_penalty_used, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -604,8 +633,8 @@ async def upsert_subtitle_record_async(
 # ============================================================
 async def main():
     with log_group("1) قراءة الإعدادات والمدخلات"):
-        video_url = os.environ.get("VIDEO_URL", "")
-        infohash = os.environ.get("INFOHASH", "")
+        video_url = os.environ["VIDEO_URL"]
+        infohash = os.environ["INFOHASH"]
 
         flix_id = os.environ.get("FLIX_ID", "").strip()
         file_idx_raw = os.environ.get("FILE_IDX", "").strip()
@@ -670,13 +699,12 @@ async def main():
                     log(f"طريقة الحصول على الصوت المستخدمة: "
                         f"{'تحميل متوازي محلي (aria2c)' if used_parallel else 'streaming مباشر (fallback)'}")
 
-                with log_group("5) مزامنة الترجمة (الذكاء الاصطناعي Whisper + alass)"):
+                with log_group("5) مزامنة الترجمة (alass-cli)"):
                     raw_subtitle_path = os.path.join(work_dir, f"input.{fmt}")
                     subs.save(raw_subtitle_path, format_=fmt)
 
                     synced_path = os.path.join(work_dir, f"synced.{fmt}")
-                    # تمرير work_dir للدالة المحدثة
-                    await sync_subtitle_full_async(audio_path, raw_subtitle_path, synced_path, ALASS_SPLIT_PENALTY, work_dir)
+                    await sync_subtitle_full_async(audio_path, raw_subtitle_path, synced_path, ALASS_SPLIT_PENALTY)
 
                     synced_subs = pysubs2.SSAFile.load(synced_path, format_=fmt)
                     approx_offset = estimate_average_offset_seconds(subs, synced_subs)
