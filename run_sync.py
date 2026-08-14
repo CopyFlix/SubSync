@@ -1,178 +1,28 @@
 """
-run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخل GitHub Actions.
-تستقبل مدخلاتها من متغيرات البيئة (من client_payload)، تعالج فيلم/حلقة واحدة،
-وتخزن النتيجة في Cloudflare D1.
+التعديلات الجوهرية على run_sync.py - يستبدل منطق التحميل الجزئي/التخمين
+وإعادة بناء التحويل الخطي بالكامل.
 
-المدخلات:
-  VIDEO_URL        - رابط مباشر لملف mkv
-  INFOHASH         - الـ infohash الخاص بالتورنت
-  FLIX_ID          - (اختياري) إذا وُجد رقم (مثلاً "27") يعتبرها حلقة مسلسل، وإذا خلا يعتبرها فيلم
-  FILE_IDX         - (اختياري) رقم الملف داخل التورنت (إذا لم يرسل يؤخذ من FLIX_ID أو يوضع 0)
-  SUBTITLE_B64_GZ  - نص ملف الترجمة مضغوط بـ Gzip ومحكّم بـ Base64
-  SUBTITLE_URL     - (بديل) رابط الترجمة الاحتياطي
-
-  CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
+الفكرة: بدل ما نحمّل جزء من الفيديو ونخمّن حجمه ونحلل أول 20 دقيقة بس،
+خلي ffmpeg يسحب الصوت من الرابط مباشرة (streaming) للحلقة/الفيلم كامل،
+وخلي alass يشتغل على ملف الترجمة كامل بدون --no-splits عشان يقدر
+يكتشف أي قطع/حذف مشاهد بنفسه (split-based alignment)، بدل ما نفرض
+عليه تحويل خطي واحد يفشل في أي حالة غير "انزياح ثابت بسيط".
 """
 
 import asyncio
-import base64
-import codecs
-import gzip
-import io
-import json
 import os
-import re
-import sys
-import tempfile
-import zipfile
-from typing import Optional, Tuple
-from urllib.parse import urlparse
-
-import aiohttp
-import pysubs2
-
-CHUNK_EXTENSION = "mkv"
-
-TARGET_AUDIO_SEC = int(os.environ.get("TARGET_AUDIO_MINUTES", "20")) * 60
-
-PROBE_MB = 15
-SAFETY_MARGIN = 1.20
-MAX_CHUNK_MB = 1500
-DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=600)
-D1_MAX_VALUE_BYTES = 1_900_000
-SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
-
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-}
-
-CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
-CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
-CF_D1_DATABASE_ID = os.environ.get("CF_D1_DATABASE_ID")
-D1_QUERY_URL = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_DATABASE_ID}/query"
-
-
-class JobError(Exception):
-    pass
-
 
 # ============================================================
-# فك التغليف والتحليل والتحديد التلقائي لصيغة الترجمة
+# 1) استخراج الصوت الكامل مباشرة من الرابط (بدون تحميل يدوي/تخمين حجم)
 # ============================================================
-def detect_and_read_text(content_bytes: bytes) -> str:
-    if content_bytes.startswith(codecs.BOM_UTF8):
-        return content_bytes.decode("utf-8-sig")
-    if content_bytes.startswith(codecs.BOM_UTF16_LE):
-        return content_bytes.decode("utf-16-le")
-    if content_bytes.startswith(codecs.BOM_UTF16_BE):
-        return content_bytes.decode("utf-16-be")
-    try:
-        return content_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-    try:
-        return content_bytes.decode("utf-16")
-    except UnicodeDecodeError:
-        pass
-    return content_bytes.decode("windows-1256", errors="replace")
+ALASS_TIMEOUT_SEC = 1800  # 30 دقيقة - عدّلها حسب مدة الحلقة/الفيلم المتوقعة
+FFMPEG_TIMEOUT_SEC = 1800
 
 
-def _pick_best_zip_member(zf: zipfile.ZipFile) -> Optional[str]:
-    candidates = [n for n in zf.namelist() if not n.endswith("/") and n.lower().endswith(SUBTITLE_EXTS)]
-    if not candidates:
-        return None
-    for ext in SUBTITLE_EXTS:
-        for name in candidates:
-            if name.lower().endswith(ext):
-                return name
-    return candidates[0]
-
-
-def unwrap_subtitle_bytes(raw_bytes: bytes, filename: str) -> Tuple[bytes, str]:
-    current_bytes, current_name = raw_bytes, filename
-    for _ in range(5):
-        if current_bytes.startswith(b"PK\x03\x04"):
-            with zipfile.ZipFile(io.BytesIO(current_bytes)) as zf:
-                member = _pick_best_zip_member(zf)
-                if not member:
-                    raise JobError("ملف الـ zip لا يحتوي على ملف ترجمة مدعوم (.srt/.ass/.ssa)")
-                current_bytes = zf.read(member)
-                current_name = member
-            continue
-        if current_bytes.startswith(b"\x1f\x8b") or current_name.lower().endswith(".gz"):
-            try:
-                current_bytes = gzip.decompress(current_bytes)
-            except Exception as e:
-                raise JobError(f"فشل فك ضغط .gz: {e}")
-            current_name = re.sub(r"\.gz$", "", current_name, flags=re.IGNORECASE)
-            continue
-        break
-
-    lower_name = current_name.lower()
-    ext = next((e for e in SUBTITLE_EXTS if lower_name.endswith(e)), None) or ".srt"
-    return current_bytes, ext
-
-
-def load_subtitle_preserving_format(raw_bytes: bytes, filename: str) -> Tuple[pysubs2.SSAFile, str]:
-    final_bytes, ext = unwrap_subtitle_bytes(raw_bytes, filename)
-    text_content = detect_and_read_text(final_bytes)
-
-    # محاولة معرفة الصيغة تلقائياً من محتوى النص نفسه
-    subs = None
-    detected_fmt = "srt"
-
-    # تجربة قراءته كـ ASS/SSA أولاً
-    try:
-        candidate = pysubs2.SSAFile.from_string(text_content, format_="ass")
-        if candidate.events:
-            subs = candidate
-            detected_fmt = "ass"
-    except Exception:
-        pass
-
-    # إذا لم ينفع كـ ASS نجرب SRT أو القراءة التلقائية
-    if subs is None:
-        try:
-            candidate = pysubs2.SSAFile.from_string(text_content)
-            if candidate.events:
-                subs = candidate
-                detected_fmt = candidate.format or "srt"
-        except Exception:
-            pass
-
-    if subs is None or not subs.events:
-        preview = text_content[:300].replace("\n", " \u23ce ")
-        raise JobError(
-            f"ملف الترجمة اتحمّل لكن مفيهوش أي أسطر مقروءة. "
-            f"معاينة أول 300 حرف من الملف: {preview}"
-        )
-
-    return subs, detected_fmt
-
-
-# ============================================================
-# الشبكة و subprocess
-# ============================================================
-async def check_range_support_async(session, url):
-    headers = {"Range": "bytes=0-1023"}
-    async with session.get(url, headers=headers) as r:
-        await r.read()
-        return r.status == 206
-
-
-async def download_range_async(session, url, start, end, output_path):
-    headers = {"Range": f"bytes={start}-{end}"}
-    async with session.get(url, headers=headers) as resp:
-        with open(output_path, "wb") as f:
-            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                f.write(chunk)
-    return output_path
-
-
-async def run_subprocess_async(cmd, timeout=180):
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+async def run_subprocess_async(cmd, timeout):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -182,266 +32,77 @@ async def run_subprocess_async(cmd, timeout=180):
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
-async def get_media_duration_seconds_async(path):
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
-    try:
-        code, out, _ = await run_subprocess_async(cmd, timeout=30)
-        return float(out.strip())
-    except Exception:
-        return None
+class JobError(Exception):
+    pass
 
 
-async def extract_audio_async(video_chunk_path, audio_out_path, duration_sec):
-    cmd = ["ffmpeg", "-y", "-v", "error", "-fflags", "+genpts+igndts", "-i", video_chunk_path,
-           "-t", str(duration_sec), "-vn", "-ac", "1", "-ar", "16000", audio_out_path]
-    code, _, _ = await run_subprocess_async(cmd, timeout=240)
-    success = code == 0 and os.path.exists(audio_out_path) and os.path.getsize(audio_out_path) > 1000
-    if not success:
-        return False, 0
-    return True, (await get_media_duration_seconds_async(audio_out_path) or 0)
-
-
-async def download_and_extract_target_duration_async(session, url, output_dir, chunk_ext, probe_mb, target_sec, safety_margin, max_mb):
-    probe_path = os.path.join(output_dir, f"probe_chunk.{chunk_ext}")
-    await download_range_async(session, url, 0, int(probe_mb * 1024 * 1024), probe_path)
-    probe_audio_path = os.path.join(output_dir, "probe_audio.wav")
-    ok, probe_duration = await extract_audio_async(probe_path, probe_audio_path, duration_sec=999)
-
-    if not ok or probe_duration <= 0:
-        needed_mb = min(target_sec / 30 * probe_mb * 4, max_mb)
-    else:
-        mb_per_sec = probe_mb / probe_duration
-        needed_mb = min(mb_per_sec * target_sec * safety_margin, max_mb)
-
-    head_path = os.path.join(output_dir, f"head_chunk.{chunk_ext}")
-    await download_range_async(session, url, 0, int(needed_mb * 1024 * 1024), head_path)
-    audio_path = os.path.join(output_dir, "audio_head.wav")
-    ok, actual_duration = await extract_audio_async(head_path, audio_path, target_sec)
-
-    if ok and actual_duration >= target_sec * 0.9:
-        return audio_path, actual_duration
-
-    if needed_mb < max_mb:
-        bigger_mb = min(needed_mb * 1.5, max_mb)
-        await download_range_async(session, url, 0, int(bigger_mb * 1024 * 1024), head_path)
-        ok, actual_duration = await extract_audio_async(head_path, audio_path, target_sec)
-
-    return (audio_path if ok else None), actual_duration
-
-
-# ============================================================
-# معالجة الترجمة على مستوى الـ events
-# ============================================================
-def crop_subtitle(subs: pysubs2.SSAFile, max_seconds: float) -> pysubs2.SSAFile:
-    max_ms = max_seconds * 1000
-    cropped = pysubs2.SSAFile()
-    cropped.info = dict(subs.info)
-    cropped.styles = dict(subs.styles)
-    cropped.events = [e.copy() for e in subs.events if e.start <= max_ms]
-    return cropped
-
-
-def apply_offset_and_fps(subs: pysubs2.SSAFile, offset_seconds: float, fps_ratio: float = 1.0) -> pysubs2.SSAFile:
-    offset_ms = offset_seconds * 1000
-    out = pysubs2.SSAFile()
-    out.info = dict(subs.info)
-    out.styles = dict(subs.styles)
-    new_events = []
-    for e in subs.events:
-        new_e = e.copy()
-        new_start = e.start * fps_ratio + offset_ms
-        new_end = e.end * fps_ratio + offset_ms
-        if new_end <= 0:
-            continue
-        new_e.start = max(0, int(round(new_start)))
-        new_e.end = max(0, int(round(new_end)))
-        new_events.append(new_e)
-    out.events = new_events
-    return out
-
-
-def compute_linear_transform(orig_events, synced_events):
-    n = min(len(orig_events), len(synced_events))
-    if n < 2:
-        return None
-
-    xs = [orig_events[i].start for i in range(n)]
-    ys = [synced_events[i].start for i in range(n)]
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-
-    denominator = sum((x - mean_x) ** 2 for x in xs)
-    if denominator == 0:
-        ratio = 1.0
-    else:
-        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-        ratio = numerator / denominator
-
-    offset_ms = mean_y - ratio * mean_x
-    return ratio, offset_ms / 1000.0
-
-
-# ============================================================
-# Cloudflare D1
-# ============================================================
-async def upsert_subtitle_record_async(
-    session, infohash, file_idx, media_type, flix_id, ext, gz_bytes, offset_seconds, fps_ratio, audio_duration_sec
-):
-    content_b64 = base64.b64encode(gz_bytes).decode("ascii")
-    if len(content_b64) > D1_MAX_VALUE_BYTES:
-        raise JobError(f"ملف الترجمة المضغوط أكبر من الحد المسموح في D1 ({len(content_b64)} بايت بعد base64)")
-
-    # عمود sync_segments في الجدول عندك NOT NULL (من تعديل قديم). النسخة
-    # دي بتحسب إزاحة واحدة بس لكل الملف، يعني "قطعة" واحدة منطقيًا،
-    # فبنبعت 1 ثابتة عشان القيد ميفشلش.
-    sync_segments = 1
-
-    sql = """
-        INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(infohash, file_idx) DO UPDATE SET
-            media_type = excluded.media_type,
-            flix_id = excluded.flix_id,
-            ext = excluded.ext,
-            content_b64 = excluded.content_b64,
-            size_bytes = excluded.size_bytes,
-            offset_seconds = excluded.offset_seconds,
-            fps_ratio = excluded.fps_ratio,
-            audio_duration_sec = excluded.audio_duration_sec,
-            sync_segments = excluded.sync_segments,
-            created_at = excluded.created_at
+async def extract_full_audio_from_url_async(video_url: str, out_wav_path: str) -> None:
     """
-    payload = {
-        "sql": sql,
-        "params": [infohash, file_idx, media_type, flix_id, ext, content_b64, len(gz_bytes), offset_seconds, fps_ratio, audio_duration_sec, sync_segments],
-    }
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
-    async with session.post(D1_QUERY_URL, json=payload, headers=headers) as resp:
-        data = await resp.json()
-        if resp.status != 200 or not data.get("success"):
-            raise JobError(f"فشل تسجيل البيانات في D1: {data.get('errors', data)}")
+    يخلي ffmpeg يقرأ الفيديو من الرابط مباشرة (streaming) ويطلّع الصوت
+    الكامل بدون ما نحمّل الفيديو محليًا أو نخمّن حجمه. ده أبسط وأدق
+    وأقل عرضة للأخطاء من منطق probe/estimate القديم، ولازم نستخرج
+    الحلقة/الفيلم *كامل* عشان alass يقدر يشوف أي قطع مشهد ممكن يحصل
+    في أي نقطة، مش بس أول 20 دقيقة.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        # فلاجات مقاومة انقطاع الشبكة - مهمة لما بنقرأ من رابط مباشر
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", video_url,
+        "-vn", "-ac", "1", "-ar", "16000",
+        out_wav_path,
+    ]
+    code, _, stderr = await run_subprocess_async(cmd, timeout=FFMPEG_TIMEOUT_SEC)
+    if code != 0 or not os.path.exists(out_wav_path) or os.path.getsize(out_wav_path) < 1000:
+        raise JobError(f"فشل استخراج الصوت الكامل من الرابط: {stderr[:500]}")
 
 
 # ============================================================
-# التشغيلة الكاملة
+# 2) مزامنة الترجمة الكاملة مباشرة (بدون كروب / بدون إعادة بناء يدوي)
 # ============================================================
-async def main():
-    video_url = os.environ["VIDEO_URL"]
-    infohash = os.environ["INFOHASH"]
+async def sync_subtitle_full_async(audio_wav_path: str, subtitle_in_path: str, subtitle_out_path: str) -> None:
+    """
+    نشغّل alass على الملف الكامل *بدون* --no-splits عشان يقدر يعمل
+    split عند أي قطع مشهد يكتشفه (بالظبط الحالة اللي وصفتها: مشهد
+    محذوف/مقصوص يخلي الترجمة اللي بعده مش متزامنة). الافتراضي
+    (split-penalty الافتراضي) بيوازن بين تصحيح القطع وعدم إدخال
+    splits غير ضرورية.
 
-    flix_id = os.environ.get("FLIX_ID", "").strip()
-    file_idx_raw = os.environ.get("FILE_IDX", "").strip()
-    subtitle_filename = os.environ.get("SUBTITLE_FILENAME", "sub.srt").strip() or "sub.srt"
-
-    # --- التمييز التلقائي التام للأفلام vs المسلسلات ---
-    file_idx = 0
-    if file_idx_raw.isdigit():
-        file_idx = int(file_idx_raw)
-    elif flix_id.isdigit():
-        file_idx = int(flix_id)
-
-    # إذا وجد flix_id أو كان file_idx أكبر من 0 تتحدد كـ مسلسل تلقائياً، وإلا فيلم
-    if flix_id or file_idx > 0:
-        media_type = "series"
-    else:
-        media_type = "movie"
-
-    subtitle_b64_gz = os.environ.get("SUBTITLE_B64_GZ")
-    subtitle_url = os.environ.get("SUBTITLE_URL")
-
-    if not (CF_ACCOUNT_ID and CF_API_TOKEN and CF_D1_DATABASE_ID):
-        print(json.dumps({"status": "error", "error": "إعدادات Cloudflare D1 غير مكتملة"}, ensure_ascii=False))
-        sys.exit(1)
-
-    try:
-        with tempfile.TemporaryDirectory() as work_dir:
-            async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT_SEC, headers=DEFAULT_HEADERS) as session:
-
-                if subtitle_b64_gz:
-                    try:
-                        raw_bytes = gzip.decompress(base64.b64decode(subtitle_b64_gz))
-                        raw_filename = subtitle_filename
-                    except Exception as e:
-                        raise JobError(f"فشل فك ضغط بيانات الترجمة الممررة بـ Base64/Gzip: {e}")
-                elif subtitle_url:
-                    async with session.get(subtitle_url) as resp:
-                        if resp.status != 200:
-                            body_preview = (await resp.text(errors="replace"))[:300]
-                            raise JobError(
-                                f"فشل تحميل ملف الترجمة من الرابط (HTTP {resp.status}). "
-                                f"معاينة الرد: {body_preview}"
-                            )
-                        raw_bytes = await resp.read()
-                    raw_filename = os.path.basename(urlparse(subtitle_url).path) or "sub.srt"
-                else:
-                    raise JobError("يجب توفير إما SUBTITLE_B64_GZ أو SUBTITLE_URL")
-
-                subs, fmt = load_subtitle_preserving_format(raw_bytes, raw_filename)
-
-                await check_range_support_async(session, video_url)
-                audio_source, actual_duration = await download_and_extract_target_duration_async(
-                    session, video_url, work_dir, CHUNK_EXTENSION, PROBE_MB, TARGET_AUDIO_SEC, SAFETY_MARGIN, MAX_CHUNK_MB
-                )
-                if not audio_source or actual_duration <= 5:
-                    raise JobError("فشل استخراج صوت كافٍ من رابط الفيديو")
-
-                cropped = crop_subtitle(subs, actual_duration + 5)
-                cropped_path = os.path.join(work_dir, f"cropped.{fmt}")
-                cropped.save(cropped_path, format_=fmt)
-
-                cropped_synced_path = os.path.join(work_dir, f"cropped_synced.{fmt}")
-                returncode, stdout, stderr = await run_subprocess_async(
-                    ["alass-cli", audio_source, cropped_path, cropped_synced_path, "--no-split"], timeout=180
-                )
-                if returncode != 0:
-                    raise JobError(f"خطأ في alass-cli: {stderr}")
-
-                try:
-                    synced_cropped_subs = pysubs2.SSAFile.load(cropped_synced_path, format_=fmt)
-                except Exception as e:
-                    raise JobError(f"فشل قراءة ملف الإخراج من alass-cli: {e}")
-
-                transform = compute_linear_transform(cropped.events, synced_cropped_subs.events)
-                if transform is None:
-                    raise JobError(
-                        "تعذّر حساب الإزاحة - عدد أسطر الترجمة المتاحة للمقارنة غير كافٍ "
-                        f"(الأصلي: {len(cropped.events)}, بعد المزامنة: {len(synced_cropped_subs.events)})"
-                    )
-                fps_ratio, offset = transform
-
-                synced_full = apply_offset_and_fps(subs, offset, fps_ratio)
-                final_path = os.path.join(work_dir, f"final_synced.{fmt}")
-                synced_full.save(final_path, format_=fmt)
-
-                with open(final_path, "rb") as f:
-                    final_bytes = f.read()
-                gz_bytes = gzip.compress(final_bytes, compresslevel=9)
-
-                await upsert_subtitle_record_async(
-                    session, infohash, file_idx, media_type, flix_id, fmt, gz_bytes, offset, fps_ratio, actual_duration
-                )
-
-        result = {
-            "status": "success",
-            "infohash": infohash,
-            "file_idx": file_idx,
-            "media_type": media_type,
-            "flix_id": flix_id,
-            "format": fmt,
-            "actual_audio_duration_sec": round(actual_duration, 1),
-            "offset_seconds": round(offset, 3),
-            "fps_ratio": round(fps_ratio, 6),
-            "gzip_size_bytes": len(gz_bytes),
-        }
-        print(json.dumps(result, ensure_ascii=False))
-
-    except JobError as e:
-        print(json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False))
-        sys.exit(1)
-    except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False))
-        sys.exit(1)
+    ملحوظة: من غير --no-splits العملية أبطأ شوية من قبل، لكنها هي
+    الطريقة الصحيحة الوحيدة لحل المشكلة اللي بتوصفها. لو حابب توازن
+    سرعة/دقة تقدر تضيف --split-penalty برقم (5-20 مقترح في توثيق
+    alass) بدل ما تمنع الـ splits خالص.
+    """
+    cmd = ["alass-cli", audio_wav_path, subtitle_in_path, subtitle_out_path]
+    code, _, stderr = await run_subprocess_async(cmd, timeout=ALASS_TIMEOUT_SEC)
+    if code != 0:
+        raise JobError(f"خطأ في alass-cli: {stderr}")
+    if not os.path.exists(subtitle_out_path):
+        raise JobError("alass-cli لم يُنتج ملف مخرجات")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# ============================================================
+# استخدامها بدل الكتلة القديمة في main():
+#
+#   audio_path = os.path.join(work_dir, "full_audio.wav")
+#   await extract_full_audio_from_url_async(video_url, audio_path)
+#
+#   raw_subtitle_path = os.path.join(work_dir, f"input.{fmt}")
+#   subs.save(raw_subtitle_path, format_=fmt)
+#
+#   synced_path = os.path.join(work_dir, f"synced.{fmt}")
+#   await sync_subtitle_full_async(audio_path, raw_subtitle_path, synced_path)
+#
+#   with open(synced_path, "rb") as f:
+#       final_bytes = f.read()
+#   gz_bytes = gzip.compress(final_bytes, compresslevel=9)
+#
+# احذف تمامًا: crop_subtitle, apply_offset_and_fps, compute_linear_transform,
+# download_and_extract_target_duration_async, check_range_support_async,
+# download_range_async, get_media_duration_seconds_async, extract_audio_async,
+# وكل قيم PROBE_MB / SAFETY_MARGIN / MAX_CHUNK_MB / TARGET_AUDIO_SEC.
+# offset_seconds و fps_ratio في D1 بقيت غير قابلة للحساب المباشر (لأن
+# التصحيح بقى متعدد النقاط مش قيمة واحدة) - خزّن NULL/0 لهم أو احسب
+# متوسط تقريبي للعرض فقط، مش للتصحيح.
