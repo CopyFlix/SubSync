@@ -3,16 +3,34 @@ run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخ�
 تستقبل مدخلاتها من متغيرات البيئة (من client_payload)، تعالج فيلم/حلقة واحدة،
 وتخزن النتيجة في Cloudflare D1.
 
-التعديل الجوهري عن النسخة القديمة:
-- بدل تحميل جزء من الفيديو وتخمين حجمه وتحليل أول 20 دقيقة بس، بنخلي
-  ffmpeg يقرأ الفيديو من الرابط مباشرة (streaming) ويستخرج الصوت الكامل
-  للحلقة/الفيلم، مع طباعة تقدّم لحظي في اللوج.
-- بدل حساب "تحويل خطي واحد" (offset + fps ratio) يتفرض إنه انزياح ثابت
-  بس، بنسيب alass يشتغل على الترجمة الكاملة والصوت الكامل *بدون*
-  --no-splits عشان يقدر يكتشف بنفسه أي قطع/حذف مشاهد (split-based
-  alignment) - وده اللي كان بيفشل في النسخة القديمة.
-- لوجات تفصيلية في كل مرحلة، متوافقة مع GitHub Actions (::group::) عشان
-  تظهر منظمة وقابلة للطي في الـ Actions log.
+=== التعديلات الجوهرية في هذه النسخة ===
+
+1) مشكلة "التحميل البطيء":
+   قديمًا كان ffmpeg يقرأ الفيديو مباشرة من الرابط (streaming) عبر اتصال HTTP
+   واحد فقط. كثير من بوابات التورنت/الديبريد تُحدّد سرعة كل اتصال منفرد
+   (per-connection throttling) بغضّ النظر عن السرعة الكلية المتاحة.
+   الحل: تحميل الفيديو محليًا أولاً باستخدام aria2c بعدد اتصالات متوازية
+   (multi-connection download)، ثم تشغيل ffmpeg على الملف المحلي (سريع جدًا
+   لأنه بدون شبكة). لو aria2c غير متاح أو فشل، نتراجع تلقائيًا لطريقة
+   الـ streaming القديمة كـ fallback.
+
+2) مشكلة "تضحية مزامنة البداية عند مشاهد محذوفة":
+   بالتحليل الفعلي على عيّنة حقيقية، اتضح أن alass أحيانًا يضع split (أو
+   يمدّ إزاحة) خاطئة في المناطق "ضعيفة الإشارة الصوتية" في بداية الحلقة
+   (سرد + موسيقى + مؤثرات بدون حوار واضح)، لأن خوارزمية الـ voice-activity
+   ما تلاقيش فيها تطابق موثوق، فتثبت على إزاحة غلط لحد ما توصل لمنطقة حوار
+   كثيف فترجع تصحح نفسها تلقائيًا. الحل:
+     أ) رفع --split-penalty (القيمة الافتراضية عند alass هي 7؛ المدى المفيد
+        رسميًا حسب توثيق alass هو 5-20؛ القيم الأقل تضيف splits غير ضرورية).
+        رفعها يخلي alass أكثر تحفظًا فما يثقش في splits ضعيفة الدليل.
+     ب) كشف تلقائي (QA heuristic) بعد المزامنة: نقارن متوسط الإزاحة في أول
+        دقائق الحلقة (INTRO_WINDOW_SEC) بمتوسط إزاحة باقي الحلقة. لو الفرق
+        تجاوز عتبة معيّنة، نعلّم السجل needs_review=1 في D1 بدل ما نثق فيه
+        أعمى - عشان يبقى عندكم رصد آلي لأي حلقة تانية فيها نفس المشكلة.
+
+   ملحوظة: لازم تضيفوا عمود جديد لجدول subtitles قبل تشغيل هذه النسخة:
+       ALTER TABLE subtitles ADD COLUMN needs_review INTEGER DEFAULT 0;
+       ALTER TABLE subtitles ADD COLUMN split_penalty_used REAL DEFAULT 0;
 
 المدخلات:
   VIDEO_URL        - رابط مباشر لملف mkv
@@ -23,6 +41,12 @@ run_sync.py - نسخة "تشغيلة واحدة" مخصّصة للعمل داخ�
   SUBTITLE_URL     - (بديل) رابط الترجمة الاحتياطي
 
   CF_ACCOUNT_ID, CF_API_TOKEN, CF_D1_DATABASE_ID - بيانات الاتصال بـ D1
+
+  ALASS_SPLIT_PENALTY   - (اختياري، افتراضي 14) قيمة split-penalty لـ alass
+  DOWNLOAD_CONNECTIONS  - (اختياري، افتراضي 8) عدد الاتصالات المتوازية لـ aria2c
+  USE_PARALLEL_DOWNLOAD - (اختياري، افتراضي "1") تفعيل/تعطيل التحميل المتوازي
+  INTRO_WINDOW_SEC      - (اختياري، افتراضي 240) نافذة "بداية الحلقة" للفحص
+  INTRO_DRIFT_THRESHOLD_SEC - (اختياري، افتراضي 1.5) عتبة تفعيل needs_review
 """
 
 import asyncio
@@ -34,6 +58,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -47,12 +72,29 @@ import pysubs2
 D1_MAX_VALUE_BYTES = 1_900_000
 SUBTITLE_EXTS = (".srt", ".ass", ".ssa")
 
-# مهلة استخراج الصوت الكامل عبر ffmpeg (streaming من الرابط). عدّلها حسب
-# طول الحلقات/الأفلام المتوقعة عندك ومدى بطء روابط التورنت المصدرية.
+# مهلة استخراج الصوت الكامل عبر ffmpeg (على الملف المحلي أو streaming كـ fallback)
 FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", str(45 * 60)))
 FFPROBE_TIMEOUT_SEC = 30
 ALASS_TIMEOUT_SEC = int(os.environ.get("ALASS_TIMEOUT_SEC", str(20 * 60)))
 DOWNLOAD_TIMEOUT_SEC = aiohttp.ClientTimeout(total=600)
+
+# مهلة تحميل الفيديو الكامل عبر aria2c (أكبر من مهلة ffmpeg لأن الأفلام الكبيرة
+# ممكن تاخد وقت أطول في التحميل من وقت المعالجة)
+ARIA2_TIMEOUT_SEC = int(os.environ.get("ARIA2_TIMEOUT_SEC", str(60 * 60)))
+ARIA2_PATH = os.environ.get("ARIA2_PATH", "aria2c")
+DOWNLOAD_CONNECTIONS = max(1, int(os.environ.get("DOWNLOAD_CONNECTIONS", "8")))
+USE_PARALLEL_DOWNLOAD = os.environ.get("USE_PARALLEL_DOWNLOAD", "1") != "0"
+
+# قيمة split-penalty لـ alass-cli. الافتراضي عند alass نفسه هو 7، لكن رفعناها
+# هنا لتقليل الـ splits الخاطئة في مناطق ضعيفة الإشارة (سرد/موسيقى بلا حوار).
+# جرّبوا قيم بين 10 و20 حسب نوعية المحتوى عندكم.
+ALASS_SPLIT_PENALTY = os.environ.get("ALASS_SPLIT_PENALTY", "14")
+
+# نافذة "بداية الحلقة" (بالثواني) التي نفحص فيها انجراف المزامنة، والعتبة
+# التي لو تجاوزها الفرق بين إزاحة البداية وإزاحة باقي الحلقة، نعلّم السجل
+# needs_review=1 بدل ما نثق فيه تلقائيًا.
+INTRO_WINDOW_SEC = float(os.environ.get("INTRO_WINDOW_SEC", "240"))
+INTRO_DRIFT_THRESHOLD_SEC = float(os.environ.get("INTRO_DRIFT_THRESHOLD_SEC", "1.5"))
 
 # كل كام ثانية نطبع سطر تقدّم جديد للتحميل (عشان منغرقش اللوج بآلاف الأسطر)
 PROGRESS_LOG_INTERVAL_SEC = 5
@@ -213,14 +255,14 @@ async def run_subprocess_async(cmd, timeout):
 
 
 # ============================================================
-# جلب مدة الفيديو من الرابط مباشرة (لعرض نسبة التقدّم فقط)
+# جلب مدة الفيديو (من رابط أو ملف محلي) - لعرض نسبة التقدّم فقط
 # ============================================================
-async def get_remote_video_duration_seconds(video_url: str) -> Optional[float]:
+async def get_video_duration_seconds(video_path_or_url: str) -> Optional[float]:
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        video_url,
+        video_path_or_url,
     ]
     try:
         code, out, err = await run_subprocess_async(cmd, timeout=FFPROBE_TIMEOUT_SEC)
@@ -234,7 +276,99 @@ async def get_remote_video_duration_seconds(video_url: str) -> Optional[float]:
 
 
 # ============================================================
-# استخراج الصوت الكامل من الرابط مباشرة، مع تقدّم لحظي في اللوج
+# جديد: التحقق من توفر aria2c في البيئة
+# ============================================================
+def aria2c_available() -> bool:
+    return shutil.which(ARIA2_PATH) is not None
+
+
+# ============================================================
+# جديد: تحميل الفيديو محليًا باتصالات متوازية عبر aria2c
+# ============================================================
+async def download_video_parallel_async(video_url: str, out_path: str) -> bool:
+    """
+    يحمّل الفيديو كاملاً لملف محلي باستخدام aria2c بعدد اتصالات متوازية.
+    يرجع True لو التحميل نجح، وFalse لو فشل (وقتها هنرجع لطريقة الـ streaming
+    القديمة كـ fallback).
+
+    ليه aria2c بدل asyncio يدوي؟ لأنه أداة ناضجة وموثوقة، بتتعامل تلقائيًا مع:
+    - الرجوع لاتصال واحد لو السيرفر مايدعمش Range requests
+    - إعادة المحاولة عند انقطاع الاتصال
+    - إعادة استئناف التحميل (resume) بدل البدء من الصفر
+    """
+    out_dir = os.path.dirname(out_path)
+    out_name = os.path.basename(out_path)
+
+    cmd = [
+        ARIA2_PATH,
+        "--dir", out_dir,
+        "--out", out_name,
+        "--max-connection-per-server", str(DOWNLOAD_CONNECTIONS),
+        "--split", str(DOWNLOAD_CONNECTIONS),
+        "--min-split-size", "5M",
+        "--max-tries", "5",
+        "--retry-wait", "3",
+        "--continue", "true",
+        "--allow-overwrite", "true",
+        "--summary-interval", str(PROGRESS_LOG_INTERVAL_SEC),
+        "--console-log-level", "warn",
+        "--user-agent", DEFAULT_HEADERS["User-Agent"],
+        video_url,
+    ]
+
+    log(f"بدء التحميل المتوازي عبر aria2c ({DOWNLOAD_CONNECTIONS} اتصالات متزامنة)...")
+    start = time.monotonic()
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+
+    progress_re = re.compile(r"\((\d{1,3})%\).*?DL:\s*([\d.]+\w?i?B)")
+    last_log_time = 0.0
+
+    async def read_output():
+        nonlocal last_log_time
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+            m = progress_re.search(text)
+            now = time.monotonic()
+            if m and now - last_log_time >= PROGRESS_LOG_INTERVAL_SEC:
+                last_log_time = now
+                pct, speed = m.group(1), m.group(2)
+                log(f"  تحميل الفيديو (aria2c): {pct}% - السرعة: {speed}/s")
+            elif not m:
+                # أسطر تحذير/خطأ من aria2c نطبعها زي ما هي للتشخيص
+                log(f"  aria2c: {text[:300]}")
+
+    try:
+        await asyncio.wait_for(read_output(), timeout=ARIA2_TIMEOUT_SEC)
+        returncode = await asyncio.wait_for(proc.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        log(f"تحذير: انتهت مهلة aria2c (timeout بعد {ARIA2_TIMEOUT_SEC}s)، هنرجع لطريقة الـ streaming")
+        return False
+
+    if returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+        log(f"تحذير: فشل aria2c (returncode={returncode})، هنرجع لطريقة الـ streaming")
+        return False
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    elapsed = time.monotonic() - start
+    speed_mb_s = size_mb / elapsed if elapsed > 0 else 0
+    log(f"اكتمل تحميل الفيديو محليًا بنجاح. الحجم: {size_mb:.1f} MB "
+        f"خلال {fmt_hms(elapsed)} (~{speed_mb_s:.1f} MB/s)")
+    return True
+
+
+# ============================================================
+# استخراج الصوت الكامل - من رابط مباشر (streaming) - الطريقة القديمة كـ fallback
 # ============================================================
 async def extract_full_audio_from_url_async(video_url: str, out_wav_path: str, total_duration: Optional[float]) -> None:
     cmd = [
@@ -247,9 +381,27 @@ async def extract_full_audio_from_url_async(video_url: str, out_wav_path: str, t
         "-progress", "pipe:1", "-nostats",
         out_wav_path,
     ]
-    log(f"بدء استخراج الصوت من الرابط (streaming)... المدة الكلية المتوقعة: "
+    log(f"بدء استخراج الصوت من الرابط مباشرة (streaming، بدون تحميل محلي)... المدة الكلية المتوقعة: "
         f"{fmt_hms(total_duration) if total_duration else 'غير معروفة'}")
+    await _run_ffmpeg_extract(cmd, out_wav_path, total_duration)
 
+
+# ============================================================
+# جديد: استخراج الصوت من ملف محلي (سريع جدًا، بدون شبكة)
+# ============================================================
+async def extract_full_audio_from_local_file_async(video_path: str, out_wav_path: str, total_duration: Optional[float]) -> None:
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", video_path,
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-progress", "pipe:1", "-nostats",
+        out_wav_path,
+    ]
+    log("بدء استخراج الصوت من الملف المحلي (سريع، بدون شبكة)...")
+    await _run_ffmpeg_extract(cmd, out_wav_path, total_duration)
+
+
+async def _run_ffmpeg_extract(cmd, out_wav_path: str, total_duration: Optional[float]) -> None:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
@@ -280,11 +432,11 @@ async def extract_full_audio_from_url_async(video_url: str, out_wav_path: str, t
                         speed = (out_time_sec / elapsed_real) if elapsed_real > 0 else 0
                         eta = (total_duration - out_time_sec) / speed if speed > 0 else None
                         eta_str = fmt_hms(eta) if eta is not None else "غير معروف"
-                        log(f"  تحميل/استخراج الصوت: {pct:5.1f}% "
+                        log(f"  استخراج الصوت: {pct:5.1f}% "
                             f"({fmt_hms(out_time_sec)} / {fmt_hms(total_duration)}) "
                             f"- سرعة تقريبية: {speed:.2f}x - الوقت المتبقي التقريبي: {eta_str}")
                     else:
-                        log(f"  تحميل/استخراج الصوت: وصلنا لـ {fmt_hms(out_time_sec)} من الفيديو حتى الآن")
+                        log(f"  استخراج الصوت: وصلنا لـ {fmt_hms(out_time_sec)} من الفيديو حتى الآن")
 
     try:
         await asyncio.wait_for(read_progress(), timeout=FFMPEG_TIMEOUT_SEC)
@@ -298,7 +450,7 @@ async def extract_full_audio_from_url_async(video_url: str, out_wav_path: str, t
     stderr_text = stderr_bytes.decode(errors="replace")
 
     if returncode != 0 or not os.path.exists(out_wav_path) or os.path.getsize(out_wav_path) < 1000:
-        raise JobError(f"فشل استخراج الصوت الكامل من الرابط: {stderr_text[:500]}")
+        raise JobError(f"فشل استخراج الصوت الكامل: {stderr_text[:500]}")
 
     size_mb = os.path.getsize(out_wav_path) / (1024 * 1024)
     log(f"اكتمل استخراج الصوت بنجاح. حجم ملف الصوت: {size_mb:.1f} MB "
@@ -306,18 +458,55 @@ async def extract_full_audio_from_url_async(video_url: str, out_wav_path: str, t
 
 
 # ============================================================
+# جديد: تنسيق موحّد يجرّب التحميل المتوازي أولاً ثم يتراجع للـ streaming
+# ============================================================
+async def obtain_full_audio_async(video_url: str, work_dir: str, total_duration: Optional[float]) -> Tuple[str, bool]:
+    """
+    يرجع (مسار ملف الصوت الناتج، هل استُخدم التحميل المحلي المتوازي).
+    """
+    audio_path = os.path.join(work_dir, "full_audio.wav")
+
+    if USE_PARALLEL_DOWNLOAD and aria2c_available():
+        video_local_path = os.path.join(work_dir, "source_video.mkv")
+        downloaded = await download_video_parallel_async(video_url, video_local_path)
+        if downloaded:
+            try:
+                await extract_full_audio_from_local_file_async(video_local_path, audio_path, total_duration)
+                return audio_path, True
+            finally:
+                # نمسح ملف الفيديو فورًا لتوفير مساحة القرص (ممكن يكون
+                # الفيلم كبير والـ runner عنده مساحة محدودة)
+                try:
+                    if os.path.exists(video_local_path):
+                        os.remove(video_local_path)
+                except OSError:
+                    pass
+        # لو فشل التحميل المتوازي، هنكمل تحت لطريقة الـ streaming
+    elif USE_PARALLEL_DOWNLOAD and not aria2c_available():
+        log("تحذير: aria2c غير مثبّت في البيئة، هنستخدم طريقة الـ streaming القديمة. "
+            "(يفضّل تثبيته عبر: apt-get install -y aria2)")
+
+    await extract_full_audio_from_url_async(video_url, audio_path, total_duration)
+    return audio_path, False
+
+
+# ============================================================
 # مزامنة الترجمة الكاملة عبر alass (بدون --no-splits عشان يكتشف القطع)
 # ============================================================
-async def sync_subtitle_full_async(audio_wav_path: str, subtitle_in_path: str, subtitle_out_path: str) -> None:
+async def sync_subtitle_full_async(audio_wav_path: str, subtitle_in_path: str, subtitle_out_path: str, split_penalty: str) -> None:
     """
     نشغّل alass على الملف الكامل *بدون* --no-splits عشان يقدر يعمل split
     عند أي قطع/حذف مشهد يكتشفه، بدل ما نفرض عليه تحويل خطي واحد.
+
+    split_penalty أعلى من الافتراضي (7) يخلي alass أكثر تحفظًا في إضافة
+    splits جديدة، وده بيقلل احتمال الـ splits الخاطئة في مناطق ضعيفة
+    الإشارة الصوتية (سرد/موسيقى بلا حوار) زي بداية الحلقات عادةً.
     """
-    log("بدء مزامنة الترجمة عبر alass-cli (split-based alignment)...")
-    cmd = ["alass-cli", audio_wav_path, subtitle_in_path, subtitle_out_path]
+    log(f"بدء مزامنة الترجمة عبر alass-cli (split-based alignment، split-penalty={split_penalty})...")
+    cmd = ["alass-cli", "--split-penalty", str(split_penalty), audio_wav_path, subtitle_in_path, subtitle_out_path]
     code, stdout, stderr = await run_subprocess_async(cmd, timeout=ALASS_TIMEOUT_SEC)
     if stdout.strip():
-        log(f"مخرجات alass-cli: {stdout.strip()[:1000]}")
+        log(f"مخرجات alass-cli: {stdout.strip()[:1500]}")
     if code != 0:
         raise JobError(f"خطأ في alass-cli: {stderr[:1000]}")
     if not os.path.exists(subtitle_out_path):
@@ -327,10 +516,8 @@ async def sync_subtitle_full_async(audio_wav_path: str, subtitle_in_path: str, s
 
 def estimate_average_offset_seconds(original: pysubs2.SSAFile, synced: pysubs2.SSAFile) -> float:
     """
-    قيمة تقريبية *للعرض/التسجيل فقط* (مش للتصحيح) - متوسط الفرق بين
-    توقيتات أول عدد من الأسطر المتطابقة بالترتيب قبل/بعد المزامنة.
-    بما إن المزامنة بقت متعددة النقاط (splits)، القيمة دي وصفية بس
-    ومش بتمثل تحويل واحد يقدر يتطبق يدويًا.
+    قيمة تقريبية *للعرض/التسجيل فقط* - متوسط الفرق بين توقيتات أول عدد من
+    الأسطر المتطابقة بالترتيب قبل/بعد المزامنة.
     """
     n = min(len(original.events), len(synced.events), 50)
     if n < 1:
@@ -340,11 +527,59 @@ def estimate_average_offset_seconds(original: pysubs2.SSAFile, synced: pysubs2.S
 
 
 # ============================================================
+# جديد: كشف انجراف المزامنة في بداية الحلقة (intro drift detection)
+# ============================================================
+def detect_intro_drift(
+    original: pysubs2.SSAFile,
+    synced: pysubs2.SSAFile,
+    intro_window_sec: float = INTRO_WINDOW_SEC,
+    drift_threshold_sec: float = INTRO_DRIFT_THRESHOLD_SEC,
+) -> Tuple[bool, float, float]:
+    """
+    يقارن متوسط إزاحة الأسطر اللي بدايتها الأصلية جوه أول intro_window_sec
+    ثانية من الحلقة، بمتوسط إزاحة باقي الأسطر. لو الفرق تجاوز العتبة، ده
+    مؤشر على المشكلة اللي بنعالجها: alass بيمدّ إزاحة خاطئة على البداية
+    (منطقة ضعيفة الإشارة) لحد ما يلاقي حوار كثيف يصحح بيه نفسه.
+
+    يرجع (needs_review, intro_avg_offset, rest_avg_offset)
+    """
+    n = min(len(original.events), len(synced.events))
+    if n < 4:
+        return False, 0.0, 0.0
+
+    intro_diffs, rest_diffs = [], []
+    for i in range(n):
+        diff_sec = (synced.events[i].start - original.events[i].start) / 1000.0
+        if original.events[i].start / 1000.0 <= intro_window_sec:
+            intro_diffs.append(diff_sec)
+        else:
+            rest_diffs.append(diff_sec)
+
+    if not intro_diffs or not rest_diffs:
+        return False, 0.0, 0.0
+
+    intro_avg = sum(intro_diffs) / len(intro_diffs)
+    rest_avg = sum(rest_diffs) / len(rest_diffs)
+    drift = abs(intro_avg - rest_avg)
+
+    needs_review = drift > drift_threshold_sec
+    if needs_review:
+        log(f"تحذير QA: انجراف مشبوه بين مزامنة البداية ({intro_avg:.2f}s) "
+            f"وباقي الحلقة ({rest_avg:.2f}s) - الفرق {drift:.2f}s > العتبة "
+            f"{drift_threshold_sec}s. تم تعليم السجل needs_review=1.")
+    else:
+        log(f"فحص QA: إزاحة البداية {intro_avg:.2f}s مقابل باقي الحلقة {rest_avg:.2f}s "
+            f"(فرق {drift:.2f}s) - ضمن الحدود المقبولة.")
+
+    return needs_review, intro_avg, rest_avg
+
+
+# ============================================================
 # Cloudflare D1
 # ============================================================
 async def upsert_subtitle_record_async(
     session, infohash, file_idx, media_type, flix_id, ext, gz_bytes,
-    approx_offset_seconds, audio_duration_sec
+    approx_offset_seconds, audio_duration_sec, needs_review: bool, split_penalty: str
 ):
     content_b64 = base64.b64encode(gz_bytes).decode("ascii")
     if len(content_b64) > D1_MAX_VALUE_BYTES:
@@ -357,9 +592,13 @@ async def upsert_subtitle_record_async(
     fps_ratio = 1.0
     sync_segments = 1
 
+    # ملحوظة: العمودين needs_review و split_penalty_used لازم تضيفوهم يدويًا
+    # مرة واحدة عبر:
+    #   ALTER TABLE subtitles ADD COLUMN needs_review INTEGER DEFAULT 0;
+    #   ALTER TABLE subtitles ADD COLUMN split_penalty_used REAL DEFAULT 0;
     sql = """
-        INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        INSERT INTO subtitles (infohash, file_idx, media_type, flix_id, ext, content_b64, size_bytes, offset_seconds, fps_ratio, audio_duration_sec, sync_segments, needs_review, split_penalty_used, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(infohash, file_idx) DO UPDATE SET
             media_type = excluded.media_type,
             flix_id = excluded.flix_id,
@@ -370,12 +609,15 @@ async def upsert_subtitle_record_async(
             fps_ratio = excluded.fps_ratio,
             audio_duration_sec = excluded.audio_duration_sec,
             sync_segments = excluded.sync_segments,
+            needs_review = excluded.needs_review,
+            split_penalty_used = excluded.split_penalty_used,
             created_at = excluded.created_at
     """
     payload = {
         "sql": sql,
         "params": [infohash, file_idx, media_type, flix_id, ext, content_b64, len(gz_bytes),
-                   approx_offset_seconds, fps_ratio, audio_duration_sec, sync_segments],
+                   approx_offset_seconds, fps_ratio, audio_duration_sec, sync_segments,
+                   1 if needs_review else 0, float(split_penalty)],
     }
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     log("جاري رفع الترجمة المزامنة إلى Cloudflare D1...")
@@ -411,6 +653,8 @@ async def main():
 
         log(f"infohash={infohash} file_idx={file_idx} media_type={media_type} flix_id={flix_id or '-'}")
         log(f"video_url={video_url}")
+        log(f"split_penalty={ALASS_SPLIT_PENALTY} parallel_download={USE_PARALLEL_DOWNLOAD} "
+            f"connections={DOWNLOAD_CONNECTIONS} aria2c_available={aria2c_available()}")
 
         if not (CF_ACCOUNT_ID and CF_API_TOKEN and CF_D1_DATABASE_ID):
             print(json.dumps({"status": "error", "error": "إعدادات Cloudflare D1 غير مكتملة"}, ensure_ascii=False))
@@ -445,25 +689,28 @@ async def main():
                     subs, fmt = load_subtitle_preserving_format(raw_bytes, raw_filename)
 
                 with log_group("3) معرفة مدة الفيديو (لعرض نسبة التقدّم فقط)"):
-                    total_duration = await get_remote_video_duration_seconds(video_url)
+                    total_duration = await get_video_duration_seconds(video_url)
                     if total_duration:
                         log(f"مدة الفيديو: {fmt_hms(total_duration)}")
 
-                with log_group("4) استخراج الصوت الكامل من الفيديو (streaming)"):
-                    audio_path = os.path.join(work_dir, "full_audio.wav")
-                    await extract_full_audio_from_url_async(video_url, audio_path, total_duration)
-                    actual_duration = (await get_remote_video_duration_seconds(audio_path)) or total_duration or 0.0
+                with log_group("4) الحصول على الصوت الكامل (تحميل متوازي محلي، أو streaming كـ fallback)"):
+                    audio_path, used_parallel = await obtain_full_audio_async(video_url, work_dir, total_duration)
+                    actual_duration = (await get_video_duration_seconds(audio_path)) or total_duration or 0.0
+                    log(f"طريقة الحصول على الصوت المستخدمة: "
+                        f"{'تحميل متوازي محلي (aria2c)' if used_parallel else 'streaming مباشر (fallback)'}")
 
                 with log_group("5) مزامنة الترجمة (alass-cli)"):
                     raw_subtitle_path = os.path.join(work_dir, f"input.{fmt}")
                     subs.save(raw_subtitle_path, format_=fmt)
 
                     synced_path = os.path.join(work_dir, f"synced.{fmt}")
-                    await sync_subtitle_full_async(audio_path, raw_subtitle_path, synced_path)
+                    await sync_subtitle_full_async(audio_path, raw_subtitle_path, synced_path, ALASS_SPLIT_PENALTY)
 
                     synced_subs = pysubs2.SSAFile.load(synced_path, format_=fmt)
                     approx_offset = estimate_average_offset_seconds(subs, synced_subs)
                     log(f"متوسط تقريبي للانزياح المُصحَّح (وصفي فقط): {approx_offset:.3f}s")
+
+                    needs_review, intro_offset, rest_offset = detect_intro_drift(subs, synced_subs)
 
                 with log_group("6) ضغط ورفع النتيجة إلى D1"):
                     with open(synced_path, "rb") as f:
@@ -473,7 +720,7 @@ async def main():
 
                     await upsert_subtitle_record_async(
                         session, infohash, file_idx, media_type, flix_id, fmt, gz_bytes,
-                        approx_offset, actual_duration
+                        approx_offset, actual_duration, needs_review, ALASS_SPLIT_PENALTY
                     )
 
         result = {
@@ -485,6 +732,11 @@ async def main():
             "format": fmt,
             "video_duration_sec": round(actual_duration, 1) if actual_duration else None,
             "approx_offset_seconds": round(approx_offset, 3),
+            "intro_offset_seconds": round(intro_offset, 3),
+            "rest_offset_seconds": round(rest_offset, 3),
+            "needs_review": needs_review,
+            "split_penalty_used": ALASS_SPLIT_PENALTY,
+            "used_parallel_download": used_parallel,
             "gzip_size_bytes": len(gz_bytes),
         }
         log(f"تمت المهمة بنجاح خلال {fmt_hms(time.monotonic() - _START_TIME)}")
